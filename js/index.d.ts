@@ -200,7 +200,118 @@ export interface RecordLayout {
 
   /** Bits inside `sizeBits` that no member occupies, already merged and sorted. */
   paddingRuns: PaddingRun[];
-  paddingBits: number;
+  /** Null when the record is too large to scan — not the same as zero. */
+  paddingBits: number | null;
+
+  /** The enclosing record, when this one is declared inside another. */
+  parentRecordId: number | null;
+
+  /** Everything needed to draw this record. See `Render`. */
+  render: Render;
+}
+
+// ------------------------------------------------------------ the drawing --
+
+/**
+ * The record as something to put on a screen: which extents exist, what
+ * contains what, what overlaps what, and where the gaps are.
+ *
+ * This is the part that is easy to assume a consumer should work out for
+ * itself, and it is not. Recovering containment from a flat list of offsets
+ * means guessing which field of which base a byte belongs to, and the guess
+ * fails exactly where layout is interesting — an empty base at the same address
+ * as the first member, a virtual base that moves, a member whose tail padding
+ * the derived class reuses. Clang knows all of it while it is laying the record
+ * out, so it is reported instead of reconstructed.
+ */
+export interface Render {
+  /** Every extent that occupies bytes, in ABI order. */
+  leaves: RenderLeaf[];
+  /** Compound members — bases, record-typed fields, anonymous aggregates. */
+  groups: RenderGroup[];
+  /** Things worth naming that occupy nothing at all. */
+  markers: RenderMarker[];
+  /** Containment, as a forest over `leaves` and `groups`. */
+  tree: RenderNode[];
+  /** Byte-granular gaps, the way a byte map draws them. */
+  paddingRuns: PaddingRun[];
+  /** Null when the record is too large to scan. */
+  paddingBits: number | null;
+}
+
+export interface RenderLeaf {
+  kind: 'field' | 'bitfield' | 'special';
+  /** '' for an unnamed member; `special` leaves carry a printable label. */
+  name: string;
+  type: string | null;
+  offsetBits: number;
+  sizeBits: number;
+  /** 0 for a bit-field, which has no alignment of its own. */
+  alignBits: number;
+  /** Labels of the enclosing members, outermost first. */
+  path: string[];
+  /** The record that declares it. */
+  ownerId: number | null;
+  ownerName: string;
+  /** Empty type at an address something else already covers ([[no_unique_address]]). */
+  sharesAddress: boolean;
+  location: Location | null;
+}
+
+export interface RenderGroup {
+  kind: 'member' | 'base' | 'primary-base' | 'vbase' | 'primary-vbase';
+  name: string;
+  type: string;
+  offsetBits: number;
+  /** What it occupies here — smaller than `typeSizeBits` when tail padding is reused. */
+  sizeBits: number;
+  /** `sizeof` of its own type. */
+  typeSizeBits: number;
+  alignBits: number;
+  path: string[];
+  ownerId: number | null;
+  ownerName: string;
+  /** The record it is an instance of, for drilling in. */
+  recordId: number | null;
+  isBase: boolean;
+  isUnion: boolean;
+  /** Indices into `leaves` this group covers. */
+  leafIndexes: number[];
+  /** A base carries its specifier's span; a member, its name's position. */
+  location: Location | SourceRange | null;
+}
+
+export interface RenderMarker {
+  kind: 'empty-base' | 'zero-bitfield';
+  name: string;
+  type: string;
+  offsetBits: number;
+  path: string[];
+}
+
+export interface RenderNode {
+  kind: 'leaf' | 'group';
+  /** Index into `leaves` or `groups`. */
+  ref: number;
+  /** Its bytes intersect a sibling's — a union, EBO, reused tail padding. */
+  overlaps: boolean;
+  children: RenderNode[];
+}
+
+// ----------------------------------------------------------------- names --
+
+/** A name the user gave to a type. */
+export interface Typedef {
+  name: string;
+  qualifiedName: string;
+  location: Location | null;
+  /** What it names, as written. */
+  typeSpelling: string;
+  canonicalTypeSpelling: string;
+  sizeBits: number;
+  alignBits: number;
+  /** Set when it names a record, so no name matching is needed to find it. */
+  recordId: number | null;
 }
 
 /** Facts about the target itself, available without naming a record. */
@@ -232,6 +343,15 @@ export interface AbiResponse {
   exitCode: number;
   target: TargetInfo;
   diagnostics: Diagnostic[];
+  /**
+   * The same diagnostics as clang would have printed them: source excerpts,
+   * carets, ANSI colour. Formatting compiler output is the compiler's job —
+   * a consumer that re-renders from the structured list gets the column
+   * arithmetic subtly wrong and the caret lands one character off.
+   */
+  diagnosticsText: string;
+  /** Type names declared in the submitted file. */
+  typedefs: Typedef[];
   records: RecordLayout[];
 }
 

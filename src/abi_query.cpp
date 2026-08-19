@@ -29,6 +29,7 @@
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Driver/CreateInvocationFromArgs.h"
 #include "clang/Frontend/FrontendActions.h"
+#include "clang/Frontend/TextDiagnosticPrinter.h"
 #include "clang/Lex/PreprocessorOptions.h"
 
 #include "llvm/ADT/SmallPtrSet.h"
@@ -39,8 +40,12 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 
+#include <algorithm>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace clang;
@@ -64,10 +69,39 @@ namespace {
 class JsonDiagnostics : public DiagnosticConsumer {
 public:
   llvm::json::Array Diags;
+  /// Everything clang would have printed to a terminal, escapes and all.
+  std::string Text;
+
+  JsonDiagnostics() : TextOS(Text) {
+    // Colour on, unconditionally: there is no terminal to ask, and the
+    // consumer wants the escapes precisely so it can style the output itself.
+    // Both halves are needed — the option makes clang *ask* for colour, and
+    // enable_colors makes the string stream agree to emit it.
+    TextOpts.ShowColors = true;
+    TextOS.enable_colors(true);
+    Printer = std::make_unique<TextDiagnosticPrinter>(TextOS, TextOpts);
+  }
+
+  // The printer needs the language options and the preprocessor to render a
+  // caret line, and CompilerInstance hands them to the diagnostic client at
+  // the start of the file. Forward the whole lifecycle or it prints nothing.
+  void BeginSourceFile(const LangOptions &LO, const Preprocessor *PP) override {
+    DiagnosticConsumer::BeginSourceFile(LO, PP);
+    Printer->BeginSourceFile(LO, PP);
+  }
+  void EndSourceFile() override {
+    Printer->EndSourceFile();
+    DiagnosticConsumer::EndSourceFile();
+  }
+  void finish() override {
+    Printer->finish();
+    DiagnosticConsumer::finish();
+  }
 
   void HandleDiagnostic(DiagnosticsEngine::Level Level,
                         const Diagnostic &Info) override {
     DiagnosticConsumer::HandleDiagnostic(Level, Info);
+    Printer->HandleDiagnostic(Level, Info);
 
     const char *Severity = nullptr;
     switch (Level) {
@@ -113,6 +147,13 @@ public:
     Diags.push_back(std::move(D));
   }
 
+private:
+  DiagnosticOptions TextOpts;
+  llvm::raw_string_ostream TextOS;
+  std::unique_ptr<TextDiagnosticPrinter> Printer;
+
+public:
+
   static llvm::json::Value locationToJson(const SourceManager &SM,
                                           SourceLocation Loc) {
     if (Loc.isInvalid())
@@ -156,6 +197,8 @@ class RecordCollector : public RecursiveASTVisitor<RecordCollector> {
 public:
   std::vector<const RecordDecl *> Order;
   llvm::SmallPtrSet<const RecordDecl *, 32> Seen;
+  /// `typedef`s and alias declarations, in source order.
+  std::vector<const TypedefNameDecl *> Typedefs;
 
   /// Without this, `std::string` is never visited: an implicit instantiation is
   /// not part of the written declaration tree, so a field of that type would
@@ -167,6 +210,15 @@ public:
       return true;
     if (Seen.insert(RD).second)
       Order.push_back(RD);
+    return true;
+  }
+
+  /// A name for a type is a thing a reader can point at, so it is reported for
+  /// the same reason records are: a viewer asked what is under the cursor
+  /// should not have to compile a probe to find out.
+  bool VisitTypedefNameDecl(TypedefNameDecl *TD) {
+    if (TD && !TD->isImplicit())
+      Typedefs.push_back(TD);
     return true;
   }
 
@@ -189,6 +241,10 @@ public:
     return true;
   }
 };
+
+// ----------------------------------------------------------- render model --
+
+#include "render_model.inc"
 
 // ------------------------------------------------------------------ writer --
 
@@ -227,6 +283,11 @@ public:
     for (const RecordDecl *RD : Emit)
       Out.push_back(emitRecord(RD));
     return Out;
+  }
+
+  /// Call after run(): typedef records reference ids run() assigned.
+  llvm::json::Array typedefs(const std::vector<const TypedefNameDecl *> &TDs) {
+    return emitTypedefs(TDs);
   }
 
 private:
@@ -336,6 +397,12 @@ private:
     O["printedName"] = printed(Ctx.getCanonicalTagType(RD));
     O["isAnonymous"] = RD->getDeclName().isEmpty();
     O["isUserCode"] = isUserCode(RD);
+    // The enclosing record, when there is one. An anonymous record nested in
+    // another is drawn inside its parent rather than listed on its own, and
+    // this is how a viewer tells that case from `typedef struct { … } T;`,
+    // which is anonymous too but is a record in its own right.
+    O["parentRecordId"] =
+        idOf(dyn_cast_or_null<RecordDecl>(RD->getDeclContext()));
     O["location"] = JsonDiagnostics::locationToJson(SM, RD->getLocation());
     // The whole declaration's extent, so a caret anywhere inside it can be
     // resolved to this record — including on a blank line or a closing brace,
@@ -392,12 +459,42 @@ private:
     }
     O["paddingRuns"] = std::move(Runs);
     O["paddingBits"] = PaddingBits;
+
+    // The drawing model: containment, extents, overlap and padding, worked out
+    // where the facts are rather than inferred from them by the consumer.
+    {
+      RenderBuilder RB(Ctx, SM, Ids);
+      O["render"] = RB.build(RD, L);
+    }
     // Null rather than zero, so a consumer can tell "no padding" from "not
     // computed for a record this large".
     if (!ScanPadding)
       O["paddingBits"] = nullptr;
 
     return llvm::json::Value(std::move(O));
+  }
+
+  /// The names the user gave to types, with what they resolve to.
+  llvm::json::Array emitTypedefs(const std::vector<const TypedefNameDecl *> &TDs) {
+    llvm::json::Array Out;
+    for (const TypedefNameDecl *TD : TDs) {
+      SourceLocation Loc = TD->getLocation();
+      if (!IncludeSystem &&
+          !(Loc.isValid() && SM.isWrittenInMainFile(SM.getSpellingLoc(Loc))))
+        continue;
+      const QualType T = TD->getUnderlyingType();
+      auto [SizeBits, AlignBits] = typeInfoBits(T);
+      Out.push_back(llvm::json::Object{
+          {"name", TD->getNameAsString()},
+          {"qualifiedName", TD->getQualifiedNameAsString()},
+          {"location", JsonDiagnostics::locationToJson(SM, Loc)},
+          {"typeSpelling", printed(T)},
+          {"canonicalTypeSpelling", printed(T.getCanonicalType())},
+          {"sizeBits", SizeBits},
+          {"alignBits", AlignBits},
+          {"recordId", idOf(T->getAsRecordDecl())}});
+    }
+    return Out;
   }
 
   template <typename OccupyFn>
@@ -545,32 +642,37 @@ private:
 
 class LayoutAction : public ASTFrontendAction {
 public:
-  LayoutAction(bool IncludeSystem, llvm::json::Array &Out)
-      : IncludeSystem(IncludeSystem), Out(Out) {}
+  LayoutAction(bool IncludeSystem, llvm::json::Array &Records,
+               llvm::json::Array &Typedefs)
+      : IncludeSystem(IncludeSystem), Records(Records), Typedefs(Typedefs) {}
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
                                                  llvm::StringRef) override {
     class Consumer : public ASTConsumer {
     public:
-      Consumer(bool IncludeSystem, llvm::json::Array &Out)
-          : IncludeSystem(IncludeSystem), Out(Out) {}
+      Consumer(bool IncludeSystem, llvm::json::Array &Records,
+               llvm::json::Array &Typedefs)
+          : IncludeSystem(IncludeSystem), Records(Records), Typedefs(Typedefs) {}
       void HandleTranslationUnit(ASTContext &Ctx) override {
         RecordCollector C;
         C.TraverseDecl(Ctx.getTranslationUnitDecl());
         LayoutWriter W(Ctx, IncludeSystem);
-        Out = W.run(C.Order);
+        Records = W.run(C.Order);
+        Typedefs = W.typedefs(C.Typedefs);
       }
 
     private:
       bool IncludeSystem;
-      llvm::json::Array &Out;
+      llvm::json::Array &Records;
+      llvm::json::Array &Typedefs;
     };
-    return std::make_unique<Consumer>(IncludeSystem, Out);
+    return std::make_unique<Consumer>(IncludeSystem, Records, Typedefs);
   }
 
 private:
   bool IncludeSystem;
-  llvm::json::Array &Out;
+  llvm::json::Array &Records;
+  llvm::json::Array &Typedefs;
 };
 
 // ----------------------------------------------------------------- target --
@@ -642,6 +744,8 @@ std::string fail(llvm::StringRef Message) {
                        {"exitCode", 1},
                        {"target", nullptr},
                        {"diagnostics", llvm::json::Array{}},
+                       {"diagnosticsText", ""},
+                       {"typedefs", llvm::json::Array{}},
                        {"records", llvm::json::Array{}}};
   std::string S;
   llvm::raw_string_ostream OS(S);
@@ -799,8 +903,8 @@ std::string runQuery(llvm::StringRef RequestJson) {
   CI.getPreprocessorOpts().addRemappedFile(
       Filename, llvm::MemoryBuffer::getMemBufferCopy(Source, Filename).release());
 
-  llvm::json::Array Records;
-  LayoutAction Action(IncludeSystem, Records);
+  llvm::json::Array Records, Typedefs;
+  LayoutAction Action(IncludeSystem, Records, Typedefs);
   const bool Ok = CI.ExecuteAction(Action);
 
   llvm::json::Object O{
@@ -811,6 +915,11 @@ std::string runQuery(llvm::StringRef RequestJson) {
       {"target", CI.hasTarget() ? emitTargetInfo(CI.getTarget(), Triple)
                                 : llvm::json::Value(nullptr)},
       {"diagnostics", std::move(Diags->Diags)},
+      // The same diagnostics as clang would have printed them. Rendering
+      // compiler output — carets, source excerpts, colour — is clang's job,
+      // and the consumer that used to do it got it subtly wrong.
+      {"diagnosticsText", Diags->Text},
+      {"typedefs", std::move(Typedefs)},
       {"records", std::move(Records)}};
 
   std::string S;

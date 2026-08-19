@@ -201,6 +201,79 @@ check('an exotic triple outside any curated list still works', () => {
   }
 });
 
+// ---------------------------------------------------------- the drawing --
+
+check('the render model says what contains what', () => {
+  const res = query({
+    triple: 'x86_64-unknown-linux-gnu',
+    lang: 'c++',
+    source: 'struct Inner { int a; char b; };\nstruct Outer { Inner i; double d; };\n',
+  });
+  const outer = byName(res, 'Outer').render;
+  eq(outer.leaves.map((l) => l.name), ['a', 'b', 'd'], 'leaves, in ABI order');
+  // A field reached through a member carries the path a viewer labels it with.
+  eq(outer.leaves[0].path, ['i'], "a is reached through i");
+  eq(outer.leaves[2].path, [], 'd is a member of Outer itself');
+  eq(outer.groups.length, 1, 'one compound member');
+  eq(outer.groups[0].leafIndexes, [0, 1], 'covering the leaves inside it');
+  // The tree is a forest over those two arrays, not something to reconstruct.
+  eq(outer.tree.map((n) => [n.kind, n.ref]), [['group', 0], ['leaf', 2]], 'tree');
+  eq(outer.tree[0].children.map((n) => n.ref), [0, 1], 'children');
+  eq(outer.paddingBits, 24, 'padding between b and d');
+});
+
+check('overlap is reported, not inferred from offsets', () => {
+  const res = query({
+    triple: 'x86_64-unknown-linux-gnu',
+    source: 'union U { int i; double d; char c[4]; };',
+  });
+  const u = byName(res, 'U').render;
+  ok(u.tree.length === 3, 'three members');
+  ok(u.tree.every((n) => n.overlaps), 'every member of a union overlaps its siblings');
+});
+
+check('a member that draws nothing inside it is not a container', () => {
+  // The only member of R is a zero-width bit-field: it occupies bytes here and
+  // has nothing to expand into, so it is one block rather than an empty box.
+  const res = query({
+    triple: 'x86_64-unknown-linux-gnu',
+    lang: 'c++',
+    source: 'struct R { unsigned int : 0; };\nstruct S { R r; int i; };',
+  });
+  const s = byName(res, 'S').render;
+  eq(s.groups.length, 0, 'no group for r');
+  ok(s.leaves.some((l) => l.name === 'r' && l.sizeBits > 0), 'r is a leaf with an extent');
+});
+
+check('a nested anonymous record says whose it is', () => {
+  const res = query({
+    triple: 'x86_64-unknown-linux-gnu',
+    lang: 'c++',
+    source: 'typedef struct { int a; } Pair;\nstruct Msg { struct { int lo, hi; }; Pair p; };',
+  });
+  const msg = byName(res, 'Msg');
+  const inner = res.records.find((r) => r.isAnonymous && r.parentRecordId === msg.id);
+  ok(inner, 'the anonymous member names Msg as its parent');
+  // `typedef struct { … } T;` is anonymous too, and is a record of its own.
+  const pair = res.records.find((r) => r.printedName === 'Pair');
+  ok(pair && pair.isAnonymous && pair.parentRecordId === null, 'a typedef-ed record has no parent');
+});
+
+// ---------------------------------------------------------------- names --
+
+check('type names are reported with what they resolve to', () => {
+  const res = query({
+    triple: 'x86_64-unknown-linux-gnu',
+    lang: 'c++',
+    source: 'using u32 = unsigned int;\nstruct S { int x; };\ntypedef S Alias;\n',
+  });
+  const u32 = res.typedefs.find((t) => t.name === 'u32');
+  ok(u32, 'u32 is reported');
+  eq([u32.sizeBits, u32.alignBits, u32.canonicalTypeSpelling], [32, 32, 'unsigned int'], 'u32');
+  const alias = res.typedefs.find((t) => t.name === 'Alias');
+  eq(alias.recordId, byName(res, 'S').id, 'an alias of a record points at it by id');
+});
+
 // ----------------------------------------------------------- diagnostics --
 
 check('diagnostics are structured, not text to be re-parsed', () => {
@@ -214,6 +287,20 @@ check('diagnostics are structured, not text to be re-parsed', () => {
   ok(d.location && d.location.line === 1, 'located');
   ok(!/\[/.test(d.message), 'no ANSI escapes to strip');
   ok(!/^input\.[ch]/.test(d.message), 'no file:line: prefix to strip');
+});
+
+check('diagnostics also come rendered, the way clang prints them', () => {
+  const res = query({
+    triple: 'x86_64-unknown-linux-gnu',
+    source: 'struct S { int x; };\nint bad = ;\n',
+  });
+  const t = res.diagnosticsText;
+  ok(/input\.c:2:11/.test(t), 'carries the position');
+  ok(/\^/.test(t), 'carries the caret');
+  ok(/\x1b\[/.test(t), 'carries colour, so a consumer need not invent it');
+  // The source line is there with the colour woven through it, which is the
+  // point: a consumer styles the escapes rather than re-deriving the excerpt.
+  ok(/int bad = ;/.test(t.replace(/\x1b\[[0-9;]*m/g, '')), 'carries the source line');
 });
 
 check('a bad request is a response, not a crash', () => {
