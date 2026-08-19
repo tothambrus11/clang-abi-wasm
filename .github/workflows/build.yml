@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+
+# The LLVM build is hours from cold and seconds when cached, so the cache key is
+# the thing that matters here: it covers the pinned tag and the cmake flags, and
+# nothing else invalidates it. Editing src/ hits a warm cache every time.
+env:
+  LLVM_TAG: llvmorg-22.1.8
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache toolchain
+        id: toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/clang-abi-wasm
+          key: toolchain-${{ env.LLVM_TAG }}-${{ hashFiles('scripts/config.sh') }}
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake rsync
+
+      - name: Bootstrap (cold only)
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: scripts/bootstrap.sh
+        timeout-minutes: 300
+
+      - name: Build wasm
+        run: scripts/build.sh wasm
+
+      - name: Conformance
+        run: node test/conformance.mjs
+
+      - name: Report size
+        run: |
+          echo "### Module size" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh dist/ >> $GITHUB_STEP_SUMMARY
+          gzip -c dist/abi_query.wasm | wc -c | \
+            awk '{printf "gzipped wasm: %.1f MB\n", $1/1048576}' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clang-abi-wasm
+          path: dist/
