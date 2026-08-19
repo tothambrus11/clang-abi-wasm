@@ -219,7 +219,7 @@ check('the render model says what contains what', () => {
   // The tree is a forest over those two arrays, not something to reconstruct.
   eq(outer.tree.map((n) => [n.kind, n.ref]), [['group', 0], ['leaf', 2]], 'tree');
   eq(outer.tree[0].children.map((n) => n.ref), [0, 1], 'children');
-  eq(outer.paddingBits, 24, 'padding between b and d');
+  eq(outer.paddingBytes, 3, 'padding between b and d');
 });
 
 check('overlap is reported, not inferred from offsets', () => {
@@ -243,6 +243,63 @@ check('a member that draws nothing inside it is not a container', () => {
   const s = byName(res, 'S').render;
   eq(s.groups.length, 0, 'no group for r');
   ok(s.leaves.some((l) => l.name === 'r' && l.sizeBits > 0), 'r is a leaf with an extent');
+});
+
+check('the two padding figures each mean what they say', () => {
+  // There are two, and they differ on two axes. Neither is wrong; the point is
+  // that a consumer knows which question it is asking.
+  //
+  //   RecordLayout.paddingBits    bit-exact, and this record's own level: a
+  //                               member counts as its whole sizeof.
+  //   Render.paddingBytes         whole bytes, and everything nested: a byte
+  //                               no member anywhere inside touches.
+  //
+  // Where neither axis bites — no bit-fields, no compound members — they are
+  // the same number, and that is the case worth pinning, because a divergence
+  // there means one of them is inferring rather than counting.
+  const SIMPLE = [
+    'struct S { char c; int i; };',
+    'struct E {}; struct S { E e; int i; };',
+    'struct E {}; struct S { [[no_unique_address]] E e; };',
+    'struct E {}; struct S { [[no_unique_address]] E a; [[no_unique_address]] E b; };',
+    'struct B { int b; }; struct S : B { char c; };',
+    'struct B { int a; }; struct S : virtual B { double d; };',
+    'union S { int i; double d; char c[3]; };',
+    'struct S { char c; int x[4]; };',
+  ];
+  for (const source of SIMPLE) {
+    for (const triple of ['x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc']) {
+      const res = query({ triple, lang: 'c++', std: 'gnu++20', source });
+      eq(res.exitCode, 0, `${source}: ${res.diagnosticsText.slice(0, 200)}`);
+      const S = byName(res, 'S');
+      eq(S.render.paddingBytes * 8, S.paddingBits, `${triple} ${source}`);
+    }
+  }
+
+  // Bit-fields: the record counts the unused bits of a storage unit, the
+  // drawing does not, because the byte belongs to the field that occupies part
+  // of it and a byte map cannot hatch half of it.
+  const bits = query({
+    triple: 'x86_64-unknown-linux-gnu',
+    source: 'struct S { unsigned a : 3; unsigned : 0; unsigned b : 5; char t; };',
+  });
+  eq(byName(bits, 'S').sizeBits / 8, 8, 'sizeof');
+  eq(byName(bits, 'S').paddingBits, 48, 'every unoccupied bit');
+  eq(byName(bits, 'S').render.paddingBytes, 5, 'the bytes a map can hatch');
+
+  // A compound member: the record counts it as its whole sizeof, so its
+  // internal hole is not this record's padding. The drawing looks inside,
+  // which is the figure a reader wants — three bytes of this struct hold
+  // nothing, and that is the whole reason to look at it.
+  const nested = query({
+    triple: 'x86_64-unknown-linux-gnu',
+    lang: 'c++',
+    std: 'gnu++20',
+    source: 'struct I { int a; char b; };\nstruct S { I i; double d; };',
+  });
+  eq(byName(nested, 'S').sizeBits / 8, 16, 'sizeof');
+  eq(byName(nested, 'S').paddingBits, 0, "nothing at this record's own level");
+  eq(byName(nested, 'S').render.paddingBytes, 3, "I's hole, which is still a hole");
 });
 
 check('a nested anonymous record says whose it is', () => {

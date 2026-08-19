@@ -200,7 +200,13 @@ export interface RecordLayout {
 
   /** Bits inside `sizeBits` that no member occupies, already merged and sorted. */
   paddingRuns: PaddingRun[];
-  /** Null when the record is too large to scan — not the same as zero. */
+  /**
+   * Bit-exact, and about *this record's own level*: a member counts as its
+   * whole `sizeof`, so a hole inside a nested record is that record's padding
+   * and not this one's. `Render.paddingBytes` answers the other question —
+   * whole bytes, everything nested — and the two are equal exactly when
+   * neither difference bites. Null when the record is too large to scan.
+   */
   paddingBits: number | null;
 
   /** The enclosing record, when this one is declared inside another. */
@@ -233,10 +239,28 @@ export interface Render {
   markers: RenderMarker[];
   /** Containment, as a forest over `leaves` and `groups`. */
   tree: RenderNode[];
-  /** Byte-granular gaps, the way a byte map draws them. */
+  /**
+   * The gaps, as a byte map draws them: a byte any member touches belongs to
+   * that member, so a bit-field's storage unit is not partly padding here.
+   */
   paddingRuns: PaddingRun[];
-  /** Null when the record is too large to scan. */
-  paddingBits: number | null;
+  /**
+   * How many bytes those runs cover. Deliberately *not* `RecordLayout`'s
+   * `paddingBits`, which differs on two axes:
+   *
+   *   granularity  bit-exact there, whole bytes here — the byte holding
+   *                `unsigned a : 3` is drawn as `a`, not as mostly padding.
+   *   depth        this record's own level there, everything nested here —
+   *                `struct S { I i; double d; }` where `I` has a three-byte
+   *                hole reports 0 there and 3 here, and 3 is what a reader
+   *                wants to know.
+   *
+   * Both are true. They answer different questions, which is why they are not
+   * the same name.
+   *
+   * Null when the record is too large to scan — not zero.
+   */
+  paddingBytes: number | null;
 }
 
 export interface RenderLeaf {

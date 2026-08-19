@@ -74,7 +74,6 @@ public:
   llvm::json::Value build(const RecordDecl *RD, const ASTRecordLayout &L) {
     Root = RD;
     visit(RD, L, /*base=*/0, {}, /*inUnion=*/RD->isUnion(), TopLevel);
-    resolveSharedAddresses(RD, L);
     return emit(RD, L);
   }
 
@@ -236,13 +235,7 @@ private:
       const bool Compound =
           Target && RecordCollector::isLayoutable(Target) && hasContents(Target);
       if (!Compound) {
-        auto [SizeBits, AlignBits] = typeInfoBits(T);
-        const bool Flexible = Ctx.getAsIncompleteArrayType(T) && RD->hasFlexibleArrayMember();
-        Leaves.push_back({Leaf::Field,
-                          F->getNameAsString().empty() ? std::string("(anonymous)")
-                                                       : F->getNameAsString(),
-                          Type, Off, Flexible ? 0 : SizeBits, AlignBits, path, RD, F,
-                          /*sharesAddress=*/false});
+        addFieldLeaf(RD, F, T, Type, Off, path);
         continue;
       }
 
@@ -356,7 +349,6 @@ private:
     }
 
     unsigned Index = 0;
-    std::vector<size_t> ignored;
     for (const FieldDecl *F : RD->fields()) {
       const int64_t Off = base + int64_t(L.getFieldOffset(Index));
       ++Index;
@@ -378,12 +370,7 @@ private:
       }
       const RecordDecl *Target = T->getAsRecordDecl();
       if (!Target || !RecordCollector::isLayoutable(Target) || !hasContents(Target)) {
-        auto [SizeBits, AlignBits] = typeInfoBits(T);
-        const bool Flexible = Ctx.getAsIncompleteArrayType(T) && RD->hasFlexibleArrayMember();
-        Leaves.push_back({Leaf::Field,
-                          F->getNameAsString().empty() ? std::string("(anonymous)")
-                                                       : F->getNameAsString(),
-                          Type, Off, Flexible ? 0 : SizeBits, AlignBits, path, RD, F, false});
+        addFieldLeaf(RD, F, T, Type, Off, path);
         continue;
       }
       const ASTRecordLayout &TL = Ctx.getASTRecordLayout(Target);
@@ -412,7 +399,33 @@ private:
       into.push_back(Groups.size());
       Groups.push_back(std::move(G));
     }
-    (void)ignored;
+  }
+
+  /**
+   * One field that draws as a single block, with the extent clang gives it.
+   *
+   * `isZeroSize` is the whole point. A member whose type is empty occupies a
+   * byte of its own unless it is allowed to share an address — and whether it
+   * is depends on `[[no_unique_address]]`, on the ABI, and on what else is
+   * there. The model used to work it out by scanning for a neighbour covering
+   * the same byte, which gets `struct S { [[no_unique_address]] E e; };` wrong:
+   * nothing else is there, so the scan concluded `e` owned the byte, while the
+   * record's own padding scan — which asks clang — called the same byte
+   * padding. Two figures in one response disagreeing is the tell that one of
+   * them was inferred.
+   */
+  void addFieldLeaf(const RecordDecl *RD, const FieldDecl *F, QualType T,
+                    const std::string &Type, int64_t Off,
+                    const std::vector<std::string> &path) {
+    auto [SizeBits, AlignBits] = typeInfoBits(T);
+    // A trailing `T x[]` sits at sizeof and occupies nothing.
+    const bool Flexible = Ctx.getAsIncompleteArrayType(T) && RD->hasFlexibleArrayMember();
+    const bool ZeroSize = F->isZeroSize(Ctx);
+    Leaves.push_back({Leaf::Field,
+                      F->getNameAsString().empty() ? std::string("(anonymous)")
+                                                   : F->getNameAsString(),
+                      Type, Off, (Flexible || ZeroSize) ? 0 : SizeBits, AlignBits,
+                      path, RD, F, ZeroSize});
   }
 
   std::optional<llvm::json::Value> locationValue(const FieldDecl *F) const {
@@ -437,40 +450,6 @@ private:
       return {0, 0};
     TypeInfo TI = Ctx.getTypeInfo(T);
     return {int64_t(TI.Width), int64_t(TI.Align)};
-  }
-
-  /**
-   * A member whose type is empty occupies one byte if it needs a unique
-   * address and none at all when it shares one. Clang decides that; the
-   * evidence is whether anything else already covers the byte it starts on.
-   */
-  void resolveSharedAddresses(const RecordDecl *RD, const ASTRecordLayout &L) {
-    for (Leaf &Lf : Leaves) {
-      if (!Lf.decl)
-        continue;
-      const RecordDecl *T = Lf.decl->getType()->getAsRecordDecl();
-      if (!T || !T->isCompleteDefinition())
-        continue;
-      const auto *CXXT = dyn_cast<CXXRecordDecl>(T);
-      if (!CXXT || !CXXT->isEmpty())
-        continue;
-      // In a union every member shares the address by definition, so sharing
-      // says nothing about this one; leave it at its own sizeof.
-      if (Lf.owner && Lf.owner->isUnion())
-        continue;
-      for (const Leaf &Other : Leaves) {
-        if (&Other == &Lf || Other.sizeBits <= 0)
-          continue;
-        if (Other.offsetBits <= Lf.offsetBits &&
-            Lf.offsetBits < Other.offsetBits + Other.sizeBits) {
-          Lf.sizeBits = 0;
-          Lf.sharesAddress = true;
-          break;
-        }
-      }
-    }
-    (void)RD;
-    (void)L;
   }
 
   llvm::json::Value idOf(const RecordDecl *RD) const {
@@ -605,14 +584,21 @@ private:
     // Padding: bytes inside sizeof that no leaf covers. Computed here because
     // it is a fact about the layout, and because a viewer computing it has to
     // re-derive coverage that this walk already established.
+    //
+    // Byte granularity, not bit, and the name says so — the record's own
+    // `paddingBits` is the bit-exact figure and these two are different
+    // numbers whenever a bit-field is involved. A byte a bit-field touches
+    // belongs to that field: the grid draws it as such, and calling the
+    // remaining bits of its storage unit "padding" would report gaps nothing
+    // can point at.
     const int64_t SizeBits = bits(L.getSize());
     llvm::json::Array Runs;
-    int64_t PaddingBits = 0;
+    int64_t PaddingBytes = 0;
     const int64_t ScanLimit = 1 << 23;
-    // Byte granularity, not bit. A byte a bit-field touches belongs to that
-    // field — the grid draws it as such, and calling the remaining bits of its
-    // storage unit "padding" would report gaps nothing can point at.
-    if (SizeBits >= 0 && SizeBits <= ScanLimit) {
+    // Null rather than zero above the limit: a viewer must be able to tell "no
+    // padding" from "not measured for a record this large".
+    const bool Scanned = SizeBits >= 0 && SizeBits <= ScanLimit;
+    if (Scanned) {
       const int64_t SizeBytes = SizeBits / 8;
       std::vector<bool> Occupied(size_t(std::max<int64_t>(SizeBytes, 0)), false);
       for (const Leaf &Lf : Leaves) {
@@ -629,7 +615,7 @@ private:
         while (B < Occupied.size() && !Occupied[B]) ++B;
         Runs.push_back(
             llvm::json::Object{{"startBits", int64_t(Start) * 8}, {"endBits", int64_t(B) * 8}});
-        PaddingBits += int64_t(B - Start) * 8;
+        PaddingBytes += int64_t(B - Start);
       }
     }
 
@@ -639,6 +625,7 @@ private:
                               {"markers", std::move(MarkersJson)},
                               {"tree", treeJson(TopLevel, 0, Leaves.size())},
                               {"paddingRuns", std::move(Runs)},
-                              {"paddingBits", PaddingBits}};
+                              {"paddingBytes", Scanned ? llvm::json::Value(PaddingBytes)
+                                                       : llvm::json::Value(nullptr)}};
   }
 };
