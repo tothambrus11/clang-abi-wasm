@@ -45,6 +45,16 @@
 
 using namespace clang;
 
+// Where the shipped headers live. The wasm build mounts its pack at /usr and
+// puts the resource directory beside it; the native build points these at the
+// LLVM tree it was compiled against, so both resolve the same way.
+#ifndef ABI_DEFAULT_SYSROOT
+#define ABI_DEFAULT_SYSROOT ""
+#endif
+#ifndef ABI_DEFAULT_RESOURCE_DIR
+#define ABI_DEFAULT_RESOURCE_DIR ""
+#endif
+
 namespace {
 
 // ------------------------------------------------------------ diagnostics --
@@ -507,6 +517,39 @@ llvm::json::Value emitTargetInfo(const TargetInfo &TI,
       {"cxxAbi", T.isKnownWindowsMSVCEnvironment() ? "microsoft" : "itanium"}};
 }
 
+/// musl's per-architecture header tree for a triple, or "generic".
+///
+/// The names are musl's own directory names, which mostly but not always match
+/// LLVM's architecture spelling.
+std::string muslArch(llvm::StringRef Triple) {
+  const llvm::Triple T(Triple);
+  switch (T.getArch()) {
+  case llvm::Triple::x86_64:   return T.isX32() ? "x32" : "x86_64";
+  case llvm::Triple::x86:      return "i386";
+  case llvm::Triple::aarch64:
+  case llvm::Triple::aarch64_be: return "aarch64";
+  case llvm::Triple::arm:
+  case llvm::Triple::armeb:
+  case llvm::Triple::thumb:
+  case llvm::Triple::thumbeb:  return "arm";
+  case llvm::Triple::riscv32:  return "riscv32";
+  case llvm::Triple::riscv64:  return "riscv64";
+  case llvm::Triple::ppc:      return "powerpc";
+  case llvm::Triple::ppc64:
+  case llvm::Triple::ppc64le:  return "powerpc64";
+  case llvm::Triple::mips:
+  case llvm::Triple::mipsel:   return "mips";
+  case llvm::Triple::mips64:
+  case llvm::Triple::mips64el: return "mips64";
+  case llvm::Triple::systemz:  return "s390x";
+  case llvm::Triple::loongarch64: return "loongarch64";
+  case llvm::Triple::m68k:     return "m68k";
+  case llvm::Triple::wasm32:
+  case llvm::Triple::wasm64:   return "wasm32";
+  default:                     return "generic";
+  }
+}
+
 std::string fail(llvm::StringRef Message) {
   llvm::json::Object O{{"ok", false},
                        {"error", Message},
@@ -582,12 +625,46 @@ std::string runQuery(llvm::StringRef RequestJson) {
       Req->getBoolean("includeSystemRecords").value_or(false);
 
   // Driver-level arguments, translated to a cc1 invocation below. Taking driver
-  // flags rather than cc1 flags means callers pass what they would type, and
-  // the driver applies the target's own header search and defaults.
+  // flags rather than cc1 flags means callers pass what they would type.
   std::vector<std::string> Args{"clang",
                                 "-fsyntax-only",
                                 "--target=" + Triple,
                                 IsCxx ? "-xc++" : "-xc"};
+
+  // Header search is pinned to the shipped sysroot, never discovered.
+  //
+  // Left alone, the driver locates its resource directory relative to argv[0]
+  // and then probes the real filesystem for system headers. Under wasm there is
+  // no filesystem to probe, and natively it silently answers with *the host's*
+  // headers — so `--target=aarch64-...` would report x86-64 glibc layouts, which
+  // is precisely the class of wrong answer this library exists to avoid. Both
+  // builds therefore run -nostdinc with explicit paths, and behave the same.
+  const std::string Sysroot =
+      Req->getString("sysroot").value_or(ABI_DEFAULT_SYSROOT).str();
+  const std::string ResourceDir =
+      Req->getString("resourceDir").value_or(ABI_DEFAULT_RESOURCE_DIR).str();
+
+  if (!ResourceDir.empty()) {
+    Args.push_back("-resource-dir=" + ResourceDir);
+    Args.push_back("-nostdinc");
+    // clang's own builtin headers: stddef.h, stdint.h, the intrinsics.
+    Args.push_back("-isystem");
+    Args.push_back(ResourceDir + "/include");
+  }
+  if (!Sysroot.empty()) {
+    // libc++ before the C library: it reaches the C headers with #include_next,
+    // so anything that shadows them has to come first.
+    if (IsCxx) {
+      Args.push_back("-isystem");
+      Args.push_back(Sysroot + "/include/c++/v1");
+    }
+    // musl keeps the target-varying declarations in a per-architecture tree and
+    // the rest in a shared one; the architecture tree must win.
+    Args.push_back("-isystem");
+    Args.push_back(Sysroot + "/include/musl-arch/" + muslArch(Triple));
+    Args.push_back("-isystem");
+    Args.push_back(Sysroot + "/include/musl");
+  }
   if (auto Std = Req->getString("std"); Std && !Std->empty())
     Args.push_back(("-std=" + *Std).str());
   if (const llvm::json::Array *Flags = Req->getArray("flags"))

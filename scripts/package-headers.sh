@@ -53,21 +53,26 @@ MUSL_SRC="$ABI_CACHE/musl"
 if [[ ! -d "$MUSL_SRC" ]]; then
   git clone --depth 1 https://git.musl-libc.org/git/musl "$MUSL_SRC"
 fi
-# musl keeps the arch-varying declarations in arch/<a>/bits; the generic tree is
-# shared. Shipping every arch costs about a megabyte in total.
-mkdir -p "$OUT/include/musl"
-rsync -a "$MUSL_SRC/include/" "$OUT/include/musl/"
+# Copying musl's include/ is not enough: bits/alltypes.h does not exist in the
+# source tree. It is generated per architecture from alltypes.h.in plus that
+# arch's own template, so the headers have to be *installed*, once per arch.
+# `install-headers` needs no compiler and takes a second or two each.
+mkdir -p "$OUT/include/musl-arch"
 for arch_dir in "$MUSL_SRC"/arch/*/; do
   arch="$(basename "$arch_dir")"
-  [[ "$arch" == "generic" ]] && continue
+  staged="$ABI_CACHE/musl-headers/$arch"
+  if [[ ! -d "$staged/include" ]]; then
+    make -C "$MUSL_SRC" install-headers ARCH="$arch" DESTDIR="$staged" prefix=/ >/dev/null
+  fi
+  # The generic headers are identical across arches; only bits/ varies, so the
+  # shared tree is written once and each arch contributes just its bits/.
+  if [[ ! -d "$OUT/include/musl" ]]; then
+    mkdir -p "$OUT/include/musl"
+    rsync -a --exclude 'bits/' "$staged/include/" "$OUT/include/musl/"
+  fi
   mkdir -p "$OUT/include/musl-arch/$arch"
-  rsync -a "$arch_dir" "$OUT/include/musl-arch/$arch/"
+  rsync -a "$staged/include/bits/" "$OUT/include/musl-arch/$arch/bits/"
 done
-rsync -a "$MUSL_SRC/arch/generic/" "$OUT/include/musl-arch/generic/"
-# alltypes.h is generated from a template plus the arch's bits.
-if [[ -f "$MUSL_SRC/include/alltypes.h.in" ]]; then
-  cp "$MUSL_SRC/include/alltypes.h.in" "$OUT/include/musl/"
-fi
 
 # --------------------------------------------------------------- libc++ --
 step "libc++ headers"

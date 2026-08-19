@@ -47,8 +47,10 @@ else
   cmake -G Ninja -S "$LLVM_SRC/llvm" -B "$NATIVE_BUILD" $CMAKE_COMMON \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_ENABLE_PROJECTS=clang
+  # clang-resource-headers puts the builtin headers where the driver expects
+  # them; without it every include resolves against the *host* system instead.
   ninja -C "$NATIVE_BUILD" -j "$JOBS" clangFrontend clangDriver clangSerialization \
-    llvm-tblgen clang-tblgen
+    clang-resource-headers llvm-tblgen clang-tblgen llvm-min-tblgen
   stamp "$LLVM_TAG$CMAKE_COMMON" native
 fi
 
@@ -71,14 +73,15 @@ if current "$LLVM_TAG$CMAKE_COMMON$EMSDK_VERSION" wasm; then
   step "wasm LLVM — cached"
 else
   step "Cross-building LLVM/clang for wasm"
-  # The cross build cannot run the tblgen it just built, so it borrows the
-  # native ones. Exceptions and threads are off: nothing in the frontend needs
-  # them for a syntax-only parse, and both cost size.
+  # The cross build cannot run the tblgen binaries it produces, so it borrows
+  # the native ones. LLVM_NATIVE_TOOL_DIR rather than naming LLVM_TABLEGEN and
+  # CLANG_TABLEGEN individually: the build also reaches for llvm-min-tblgen and
+  # friends, and naming two of them leaves the rest to fail later in the build.
+  # Exceptions and threads are off — nothing in a syntax-only parse needs them.
   emcmake cmake -G Ninja -S "$LLVM_SRC/llvm" -B "$WASM_BUILD" $CMAKE_COMMON \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_ENABLE_PROJECTS=clang \
-    -DLLVM_TABLEGEN="$NATIVE_BUILD/bin/llvm-tblgen" \
-    -DCLANG_TABLEGEN="$NATIVE_BUILD/bin/clang-tblgen" \
+    -DLLVM_NATIVE_TOOL_DIR="$NATIVE_BUILD/bin" \
     -DLLVM_DEFAULT_TARGET_TRIPLE=wasm32-unknown-emscripten \
     -DLLVM_HOST_TRIPLE=wasm32-unknown-emscripten \
     -DLLVM_ENABLE_THREADS=OFF \

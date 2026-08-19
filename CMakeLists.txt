@@ -49,6 +49,23 @@ target_include_directories(abi_query_core PUBLIC
   ${LLVM_INCLUDE_DIRS}
   ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(abi_query_core PRIVATE ${LLVM_DEFINITIONS})
+
+# Header search is pinned, not discovered — see the comment in runQuery. The
+# wasm build mounts its pack at /usr; the native build borrows the resource
+# headers from the LLVM tree it links, so both behave identically and a native
+# test predicts the wasm result.
+if(EMSCRIPTEN)
+  set(ABI_SYSROOT "/usr" CACHE STRING "sysroot the module reads headers from")
+  set(ABI_RESOURCE_DIR "/usr/lib/clang/${LLVM_VERSION_MAJOR}" CACHE STRING "")
+else()
+  set(ABI_SYSROOT "" CACHE STRING "sysroot the native harness reads headers from")
+  set(ABI_RESOURCE_DIR "${LLVM_LIBRARY_DIR}/clang/${LLVM_VERSION_MAJOR}" CACHE STRING "")
+endif()
+target_compile_definitions(abi_query_core PRIVATE
+  ABI_DEFAULT_SYSROOT="${ABI_SYSROOT}"
+  ABI_DEFAULT_RESOURCE_DIR="${ABI_RESOURCE_DIR}")
+message(STATUS "resource dir: ${ABI_RESOURCE_DIR}")
+message(STATUS "sysroot     : ${ABI_SYSROOT}")
 # LLVM headers assume the flags LLVM itself was built with.
 target_compile_options(abi_query_core PRIVATE -fno-rtti -fno-exceptions)
 target_link_libraries(abi_query_core PUBLIC ${ABI_CLANG_LIBS} ${ABI_LLVM_LIBS})
