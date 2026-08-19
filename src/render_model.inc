@@ -73,7 +73,7 @@ public:
 
   llvm::json::Value build(const RecordDecl *RD, const ASTRecordLayout &L) {
     Root = RD;
-    visit(RD, L, /*base=*/0, {}, /*inUnion=*/RD->isUnion(), TopLevel);
+    visit(RD, L, /*base=*/0, {}, VBases::Here, TopLevel);
     return emit(RD, L);
   }
 
@@ -127,6 +127,21 @@ private:
   }
 
   /**
+   * Where a record's virtual bases belong.
+   *
+   * `Here` for a complete object — the record being drawn, and any member,
+   * which is a complete object of its own type. `Elsewhere` for a base
+   * subobject: its virtual bases are placed once by the most derived object,
+   * not repeated inside every class that inherits them.
+   *
+   * This used to be two nearly identical walk functions, and they drifted: the
+   * base one recursed into a record-typed *member* with itself, so a member
+   * reached through a base lost its own virtual bases and their bytes were
+   * reported as padding.
+   */
+  enum class VBases { Here, Elsewhere };
+
+  /**
    * Walk one record, adding its leaves and groups at absolute offsets.
    *
    * `base` is where this record starts inside the root, so every offset below
@@ -135,13 +150,13 @@ private:
    * rather than have to be recovered from leaf indices afterwards.
    */
   void visit(const RecordDecl *RD, const ASTRecordLayout &L, int64_t base,
-             std::vector<std::string> path, bool inUnion, std::vector<size_t> &into) {
+             std::vector<std::string> path, VBases Vb, std::vector<size_t> &into) {
     const auto *CXX = dyn_cast<CXXRecordDecl>(RD);
     std::function<void(const CXXBaseSpecifier &, bool)> addBase;
 
     // The vptr comes first wherever the record owns one.
     if (CXX) {
-      const bool OwnsVPtr = L.hasOwnVFPtr() || (CXX->isDynamicClass() && !L.getPrimaryBase());
+      const bool OwnsVPtr = ownsVFPtr(Ctx, CXX, L);
       if (OwnsVPtr) {
         Leaves.push_back({Leaf::Special, RD->getNameAsString() + " vtable pointer", "",
                           base, pointerBits(), pointerBits(), path, RD, nullptr, false});
@@ -187,11 +202,8 @@ private:
         std::vector<std::string> childPath = path;
         childPath.push_back(Label);
         std::vector<size_t> children;
-        if (!BD->isEmpty()) {
-          // A base subobject's *virtual* bases are laid out by the most derived
-          // object, not repeated inside each intermediate one.
-          visitBaseContents(BD, BL, Off, childPath, children);
-        }
+        if (!BD->isEmpty())
+          visit(BD, BL, Off, childPath, VBases::Elsewhere, children);
         G.lastLeaf = Leaves.size();
         G.childGroups = std::move(children);
         into.push_back(Groups.size());
@@ -266,7 +278,10 @@ private:
       std::vector<std::string> childPath = path;
       childPath.push_back(Label);
       std::vector<size_t> children;
-      visit(Target, TL, Off, childPath, inUnion || Target->isUnion(), children);
+      // Here, not Elsewhere: a member is a complete object of its own type, so
+      // its virtual bases are laid out inside it. Only a *base* subobject's are
+      // hoisted to the most derived object.
+      visit(Target, TL, Off, childPath, VBases::Here, children);
 
       // Nothing inside it occupies a bit — a record whose only member is a
       // zero-width bit-field, say. It still takes up space here, so it is
@@ -289,116 +304,10 @@ private:
       Groups.push_back(std::move(G));
     }
 
-    // Last, as the ABI lays them.
-    if (CXX)
+    // Last, as the ABI lays them — and only where they belong.
+    if (CXX && Vb == VBases::Here)
       for (const CXXBaseSpecifier &B : CXX->vbases())
         addBase(B, true);
-  }
-
-  /// A base subobject's own content, excluding its virtual bases.
-  void visitBaseContents(const RecordDecl *RD, const ASTRecordLayout &L, int64_t base,
-                         const std::vector<std::string> &path, std::vector<size_t> &into) {
-    // Same as visit(), minus the virtual bases: they belong to the most derived
-    // object and are emitted once, there.
-    const auto *CXX = dyn_cast<CXXRecordDecl>(RD);
-    if (CXX) {
-      const bool OwnsVPtr = L.hasOwnVFPtr() || (CXX->isDynamicClass() && !L.getPrimaryBase());
-      if (OwnsVPtr)
-        Leaves.push_back({Leaf::Special, RD->getNameAsString() + " vtable pointer", "",
-                          base, pointerBits(), pointerBits(), path, RD, nullptr, false});
-      if (L.hasOwnVBPtr())
-        Leaves.push_back({Leaf::Special, RD->getNameAsString() + " vbtable pointer", "",
-                          base + bits(L.getVBPtrOffset()), pointerBits(), pointerBits(),
-                          path, RD, nullptr, false});
-      for (const CXXBaseSpecifier &B : CXX->bases()) {
-        if (B.isVirtual())
-          continue;
-        const auto *BD = B.getType()->getAsCXXRecordDecl();
-        if (!BD || !RecordCollector::isLayoutable(BD))
-          continue;
-        const ASTRecordLayout &BL = Ctx.getASTRecordLayout(BD);
-        const int64_t Off = base + bits(L.getBaseClassOffset(BD));
-        const std::string Label = baseLabel(printed(B.getType()), false);
-        if (BD->isEmpty())
-          Markers.push_back({"empty-base", Label, printed(B.getType()), Off, path});
-
-        Group G;
-        G.kind = L.getPrimaryBase() == BD ? "primary-base" : "base";
-        G.name = Label;
-        G.type = printed(B.getType());
-        G.offsetBits = Off;
-        G.sizeBits = BD->isEmpty() ? 0 : bits(BL.getNonVirtualSize());
-        G.typeSizeBits = bits(BL.getSize());
-        G.alignBits = bits(BL.getAlignment());
-        G.path = path;
-        G.owner = RD;
-        G.target = BD;
-        G.isBase = true;
-        G.location = JsonDiagnostics::rangeToJson(SM, B.getSourceRange());
-        G.firstLeaf = Leaves.size();
-        std::vector<std::string> childPath = path;
-        childPath.push_back(Label);
-        std::vector<size_t> children;
-        if (!BD->isEmpty())
-          visitBaseContents(BD, BL, Off, childPath, children);
-        G.lastLeaf = Leaves.size();
-        G.childGroups = std::move(children);
-        into.push_back(Groups.size());
-        Groups.push_back(std::move(G));
-      }
-    }
-
-    unsigned Index = 0;
-    for (const FieldDecl *F : RD->fields()) {
-      const int64_t Off = base + int64_t(L.getFieldOffset(Index));
-      ++Index;
-      QualType T = F->getType();
-      const std::string Type = printed(T);
-      if (F->isBitField()) {
-        const unsigned Width = F->getBitWidthValue();
-        if (F->isZeroLengthBitField())
-          Markers.push_back({"zero-bitfield",
-                             F->getNameAsString().empty() ? std::string(":0")
-                                                          : F->getNameAsString(),
-                             Type, Off, path});
-        else
-          Leaves.push_back({Leaf::BitField,
-                            F->getNameAsString().empty() ? std::string("(pad bits)")
-                                                         : F->getNameAsString(),
-                            Type, Off, int64_t(Width), 0, path, RD, F, false});
-        continue;
-      }
-      const RecordDecl *Target = T->getAsRecordDecl();
-      if (!Target || !RecordCollector::isLayoutable(Target) || !hasContents(Target)) {
-        addFieldLeaf(RD, F, T, Type, Off, path);
-        continue;
-      }
-      const ASTRecordLayout &TL = Ctx.getASTRecordLayout(Target);
-      const bool Anonymous = F->getNameAsString().empty();
-      const std::string Label = Anonymous ? "(anonymous)" : F->getNameAsString();
-      Group G;
-      G.kind = "member";
-      G.name = Label;
-      G.type = Type;
-      G.offsetBits = Off;
-      G.sizeBits = bits(TL.getSize());
-      G.typeSizeBits = bits(TL.getSize());
-      G.alignBits = bits(TL.getAlignment());
-      G.path = path;
-      G.owner = RD;
-      G.target = Target;
-      G.isUnion = Target->isUnion();
-      G.location = locationValue(F);
-      G.firstLeaf = Leaves.size();
-      std::vector<std::string> childPath = path;
-      childPath.push_back(Label);
-      std::vector<size_t> children;
-      visitBaseContents(Target, TL, Off, childPath, children);
-      G.lastLeaf = Leaves.size();
-      G.childGroups = std::move(children);
-      into.push_back(Groups.size());
-      Groups.push_back(std::move(G));
-    }
   }
 
   /**

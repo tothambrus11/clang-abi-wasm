@@ -242,6 +242,26 @@ public:
   }
 };
 
+/// Does this class own a virtual function table pointer of its own?
+///
+/// The two ABIs answer differently and neither answers with one predicate.
+/// Microsoft records it: `hasOwnVFPtr()` is exactly the question, and a class
+/// with virtual bases but no virtual functions gets a *vbtable* pointer and no
+/// vfptr. Itanium keeps the virtual base offsets in the vtable itself, so such
+/// a class does own a vptr — `isDynamicClass()` covers polymorphic-or-has-vbases
+/// — unless a primary base already provides one at offset zero.
+///
+/// Asking `hasOwnVFPtr() || (isDynamicClass() && !getPrimaryBase())` on both
+/// gets Microsoft wrong: the second clause fires for a class whose only reason
+/// to be dynamic is a virtual base, and drew a phantom vtable pointer on top of
+/// the vbtable pointer.
+inline bool ownsVFPtr(const ASTContext &Ctx, const CXXRecordDecl *RD,
+                      const ASTRecordLayout &L) {
+  if (Ctx.getTargetInfo().getCXXABI().isMicrosoft())
+    return L.hasOwnVFPtr();
+  return RD->isDynamicClass() && !L.getPrimaryBase();
+}
+
 // ----------------------------------------------------------- render model --
 
 #include "render_model.inc"
@@ -506,10 +526,7 @@ private:
       return Slots;
     const int64_t PtrBits = Ctx.getTargetInfo().getPointerWidth(LangAS::Default);
 
-    // Itanium: a polymorphic class with no primary base owns the vptr at 0.
-    // Microsoft: hasOwnVFPtr() says so directly.
-    const bool OwnsVPtr =
-        L.hasOwnVFPtr() || (CXX->isDynamicClass() && !L.getPrimaryBase());
+    const bool OwnsVPtr = ownsVFPtr(Ctx, CXX, L);
     if (OwnsVPtr) {
       Slots.push_back(llvm::json::Object{
           {"kind", "vptr"},
