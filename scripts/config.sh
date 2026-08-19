@@ -4,7 +4,10 @@
 # The clang release the module is built from. Bumping this invalidates the
 # native and wasm build stamps, and nothing else.
 : "${LLVM_TAG:=llvmorg-22.1.8}"
-: "${EMSDK_VERSION:=latest}"
+# Pinned, not "latest": the cache key below is built from these values, so a
+# floating version would keep the key stable while the toolchain underneath it
+# moved — the one way a content-addressed release can lie about its inputs.
+: "${EMSDK_VERSION:=6.0.7}"
 
 # Everything heavy lives here, outside the repo, so a clean checkout costs
 # nothing and `git clean -xfd` never throws away two hours of build.

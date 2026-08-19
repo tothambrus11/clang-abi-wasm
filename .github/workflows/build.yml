@@ -1,53 +1,147 @@
 name: build
 
 on:
-  push: { branches: [main] }
+  push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
-# The LLVM build is hours from cold and seconds when cached, so the cache key is
-# the thing that matters here: it covers the pinned tag and the cmake flags, and
-# nothing else invalidates it. Editing src/ hits a warm cache every time.
-env:
-  LLVM_TAG: llvmorg-22.1.8
+# The toolchain build is the whole cost model here. Cold it is an LLVM
+# cross-compile — well over an hour. Warm it is `ninja` on one source file and
+# a link, which is seconds. So everything hangs on the cache key being exactly
+# the set of inputs that change the output: the pinned LLVM tag, the emsdk
+# version, and the cmake flags. Editing src/ or js/ must never miss the cache.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache toolchain
-        id: toolchain
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/clang-abi-wasm
-          key: toolchain-${{ env.LLVM_TAG }}-${{ hashFiles('scripts/config.sh') }}
+      - name: Read the pinned inputs
+        id: meta
+        run: |
+          # config.sh is the single source of truth; parse it rather than
+          # repeating the values here, where they would drift.
+          set -a; source scripts/config.sh; set +a
+          echo "llvm_tag=$LLVM_TAG" >> "$GITHUB_OUTPUT"
+          echo "emsdk=$EMSDK_VERSION" >> "$GITHUB_OUTPUT"
+          echo "cmake_hash=$(printf '%s' "$CMAKE_COMMON" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./js/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        # The cross build needs ~40 GB and a stock runner ships with far less
+        # free; these are the largest things no LLVM build touches.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build cmake rsync
 
-      - name: Bootstrap (cold only)
+      - name: Restore the toolchain
+        id: toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/clang-abi-wasm
+          key: toolchain-${{ runner.os }}-${{ steps.meta.outputs.llvm_tag }}-${{ steps.meta.outputs.emsdk }}-${{ steps.meta.outputs.cmake_hash }}
+
+      - name: Bootstrap the toolchain (cold cache only)
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: scripts/bootstrap.sh
-        timeout-minutes: 300
 
-      - name: Build wasm
+      - name: Build the module
         run: scripts/build.sh wasm
 
       - name: Conformance
         run: node test/conformance.mjs
 
-      - name: Report size
+      - name: Package the release
+        run: scripts/package-release.sh
+
+      - name: Report
         run: |
-          echo "### Module size" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          ls -lh dist/ >> $GITHUB_STEP_SUMMARY
-          gzip -c dist/abi_query.wasm | wc -c | \
-            awk '{printf "gzipped wasm: %.1f MB\n", $1/1048576}' >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo '### clang-abi-wasm'
+            echo
+            node -e '
+              const m = require("./release/manifest.json");
+              console.log("| file | size | gzip |");
+              console.log("|---|---:|---:|");
+              const mb = (n) => (n / 1048576).toFixed(1) + " MB";
+              for (const [k, f] of Object.entries(m.files))
+                console.log(`| ${k} | ${mb(f.bytes)} | ${mb(f.gzip)} |`);
+              const total = Object.values(m.files).reduce((a, f) => a + f.gzip, 0);
+              console.log(`| **over the wire** | | **${mb(total)}** |`);
+              console.log();
+              console.log(`clang ${m.clang}, emsdk ${m.inputs.emsdk}`);
+            '
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: clang-abi-wasm
-          path: dist/
+          name: clang-abi-wasm-${{ steps.meta.outputs.version }}
+          path: release/
+          retention-days: 30
+
+  # A tag publishes what the build job already produced and tested. Nothing is
+  # rebuilt here: the artifact that passed conformance is the artifact released.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: clang-abi-wasm-${{ needs.build.outputs.version }}
+          path: release
+
+      - name: Check the tag matches the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="${{ needs.build.outputs.version }}"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag v$tag does not match js/package.json version $pkg" >&2
+            exit 1
+          fi
+
+      - name: Release notes
+        run: |
+          node -e '
+            const m = require("./release/manifest.json");
+            const mb = (n) => (n / 1048576).toFixed(1) + " MB";
+            const total = Object.values(m.files).reduce((a, f) => a + f.gzip, 0);
+            console.log(`Built from clang ${m.clang} (${m.inputs.llvmTag}), emsdk ${m.inputs.emsdk}.`);
+            console.log();
+            console.log("| file | size | gzip |");
+            console.log("|---|---:|---:|");
+            for (const [k, f] of Object.entries(m.files))
+              console.log(`| \`${f.path}\` | ${mb(f.bytes)} | ${mb(f.gzip)} |`);
+            console.log(`| **total** | | **${mb(total)}** |`);
+            console.log();
+            console.log("Every file but `manifest.json` is content-addressed and safe to serve immutable.");
+            console.log();
+            console.log("```js");
+            console.log("import { load } from \"https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/index.mjs\";");
+            console.log("const abi = await load({ baseUrl: \"…/releases/download/${{ github.ref_name }}/\" });");
+            console.log("```");
+          ' > NOTES.md
+          cat NOTES.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          body_path: NOTES.md
+          fail_on_unmatched_files: true

@@ -127,7 +127,10 @@ cat > "$OUT/include/c++/v1/__config_site" <<'CONFIG'
 #define _LIBCPP_HAS_THREADS 1
 #define _LIBCPP_HAS_MONOTONIC_CLOCK 1
 #define _LIBCPP_HAS_TERMINAL 1
-#define _LIBCPP_HAS_MUSL_LIBC 0
+// 1, not the upstream default of 0: this pack ships musl, and libc++ picks its
+// locale and ctype implementation from this. Left at 0 it looks for a rune
+// table no musl system has and <string> fails to parse at all.
+#define _LIBCPP_HAS_MUSL_LIBC 1
 #define _LIBCPP_HAS_THREAD_API_PTHREAD 0
 #define _LIBCPP_HAS_THREAD_API_EXTERNAL 0
 #define _LIBCPP_HAS_THREAD_API_WIN32 0

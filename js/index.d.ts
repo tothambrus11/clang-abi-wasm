@@ -177,6 +177,12 @@ export interface RecordLayout {
   /** Declared in the file the caller submitted. */
   isUserCode: boolean;
   location: Location | null;
+  /**
+   * The whole declaration's extent. A caret inside it belongs to this record
+   * even where no member is declared — a blank line, the closing brace — which
+   * is how an editor resolves "which record am I in".
+   */
+  range: SourceRange | null;
 
   sizeBits: number;
   alignBits: number;

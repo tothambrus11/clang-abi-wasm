@@ -325,6 +325,11 @@ private:
     O["isAnonymous"] = RD->getDeclName().isEmpty();
     O["isUserCode"] = isUserCode(RD);
     O["location"] = JsonDiagnostics::locationToJson(SM, RD->getLocation());
+    // The whole declaration's extent, so a caret anywhere inside it can be
+    // resolved to this record — including on a blank line or a closing brace,
+    // where no member location would match.
+    O["range"] = JsonDiagnostics::rangeToJson(SM, RD->getSourceRange())
+                     .value_or(llvm::json::Value(nullptr));
 
     O["sizeBits"] = bits(L.getSize());
     O["alignBits"] = bits(L.getAlignment());
