@@ -32,7 +32,8 @@ else
   # ever build two of the projects.
   git clone --depth 1 --branch "$LLVM_TAG" --filter=blob:none --sparse \
     https://github.com/llvm/llvm-project.git "$LLVM_SRC"
-  git -C "$LLVM_SRC" sparse-checkout set llvm clang cmake third-party runtimes
+  # libcxx is headers-only for us: package-headers.sh copies them, nothing builds it.
+  git -C "$LLVM_SRC" sparse-checkout set llvm clang libcxx cmake third-party runtimes
   stamp "$LLVM_TAG" source
 fi
 
