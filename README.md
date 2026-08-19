@@ -36,6 +36,17 @@ The per-query collapse is the library shape rather than the smaller binary: no
 process start, no driver, no argv parsing, and one `ASTContext` answering
 everything the driver needed six separate compiles for.
 
+Where the remaining time goes: a query with no `#include` is 1.7 ms, and the
+same query with `<string>` is 440 ms. Almost all of that is clang parsing
+libc++ — the same source natively takes ~300 ms, so there is no wasm penalty
+worth chasing, and building the model from the parsed AST costs about 7 ms of
+it. The lever that would move it is a precompiled preamble, the way clangd
+avoids re-parsing an unchanged include block while the body below it is edited.
+It would want the record walk restricted to the main file at the same time, or
+the traversal would simply deserialize back everything the preamble saved.
+Not done; measured, and worth doing when someone is editing C++ rather than
+looking at an example.
+
 ## Why this exists
 
 The usual way to get layout information out of clang in a browser is to run the
@@ -155,11 +166,17 @@ The wasm link is mechanical once the native build is clean.
 
 ## Status
 
-Built, tested and driving [ABI Explorer](https://abiexplorer.org) end to end:
-its full browser suite passes on this module, in 45 s against the text
-pipeline's 1.1 min. `test/conformance.mjs` covers what the old pipeline got
-wrong or could not answer — base source ranges, flexible array members, empty
-members sharing an address, exotic triples, structured diagnostics.
+Built, tested and driving [ABI Explorer](https://abiexplorer.org) end to end.
+The app was rewritten onto this module: about 2500 lines of layout-dump
+parsing, probe generation, AST-location matching and containment reconstruction
+were deleted, and its browser suite runs in 51 s against the text pipeline's
+1.1 min.
+
+`test/conformance.mjs` — 20 checks — covers what the old pipeline got wrong or
+could not answer: base specifier source ranges, flexible array members, empty
+members sharing an address, exotic triples, structured *and* rendered
+diagnostics, the drawing model's containment and overlap, the standard library
+on 23 targets, and the two padding figures meaning what they say.
 
 ## Using a local build in a web app
 
