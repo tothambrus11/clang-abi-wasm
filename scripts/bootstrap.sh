@@ -88,7 +88,11 @@ else
     -DLLVM_ENABLE_UNWIND_TABLES=OFF \
     -DLLVM_ENABLE_PIC=OFF \
     -DCMAKE_CXX_FLAGS="-fno-exceptions -fno-rtti"
-  ninja -C "$WASM_BUILD" -j "$JOBS" clangFrontend clangDriver clangSerialization
+  # clang-resource-headers included: package-headers.sh reads the builtin
+  # headers out of this tree, and without them there is no resource directory
+  # to point the module at.
+  ninja -C "$WASM_BUILD" -j "$JOBS" clangFrontend clangDriver clangSerialization \
+    clang-resource-headers
   stamp "$LLVM_TAG$CMAKE_COMMON$EMSDK_VERSION" wasm
 fi
 

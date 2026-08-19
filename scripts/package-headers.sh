@@ -36,7 +36,12 @@ step() { printf '\033[1m--> %s\033[0m\n' "$1"; }
 # from the same release as the frontend.
 step "clang builtin + intrinsic headers"
 CLANG_RES="$(find "$WASM_BUILD/lib/clang" -maxdepth 2 -name include -type d | head -1)"
-[[ -d "$CLANG_RES" ]] || { echo "no clang resource dir under $WASM_BUILD/lib/clang" >&2; exit 1; }
+[[ -d "$CLANG_RES" ]] || {
+  echo "no clang resource directory under $WASM_BUILD/lib/clang" >&2
+  echo "  The wasm build has not produced clang-resource-headers." >&2
+  echo "  Run: scripts/bootstrap.sh   (or ninja -C \"$WASM_BUILD\" clang-resource-headers)" >&2
+  exit 1
+}
 # Keep clang's own layout, version directory and all: the resource directory the
 # module is compiled to expect is lib/clang/<major>, and flattening it to
 # lib/clang/include puts the builtin headers somewhere nothing looks. That

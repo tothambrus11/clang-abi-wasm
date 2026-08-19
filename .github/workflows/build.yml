@@ -33,7 +33,9 @@ jobs:
           set -a; source scripts/config.sh; set +a
           echo "llvm_tag=$LLVM_TAG" >> "$GITHUB_OUTPUT"
           echo "emsdk=$EMSDK_VERSION" >> "$GITHUB_OUTPUT"
-          echo "cmake_hash=$(printf '%s' "$CMAKE_COMMON" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          hash="$(printf '%s' "$CMAKE_COMMON" | sha256sum | cut -c1-16)"
+          echo "cmake_hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "cache_key=toolchain-${{ runner.os }}-$LLVM_TAG-$EMSDK_VERSION-$hash" >> "$GITHUB_OUTPUT"
           echo "version=$(node -p "require('./js/package.json').version")" >> "$GITHUB_OUTPUT"
 
       - name: Free disk space
@@ -47,16 +49,29 @@ jobs:
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build cmake rsync
 
+      # restore/save rather than actions/cache, deliberately. actions/cache
+      # skips its save step when the job fails — sensible for a cheap cache,
+      # ruinous for this one: a two-hour LLVM build was thrown away because a
+      # later step that takes seconds returned non-zero. The toolchain is
+      # correct or not on its own terms, so it is saved the moment it is built
+      # and never again depends on what happens after.
       - name: Restore the toolchain
         id: toolchain
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/clang-abi-wasm
-          key: toolchain-${{ runner.os }}-${{ steps.meta.outputs.llvm_tag }}-${{ steps.meta.outputs.emsdk }}-${{ steps.meta.outputs.cmake_hash }}
+          key: ${{ steps.meta.outputs.cache_key }}
 
       - name: Bootstrap the toolchain (cold cache only)
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: scripts/bootstrap.sh
+
+      - name: Save the toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/clang-abi-wasm
+          key: ${{ steps.meta.outputs.cache_key }}
 
       - name: Build the module
         run: scripts/build.sh wasm
