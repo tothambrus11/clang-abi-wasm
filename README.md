@@ -21,6 +21,21 @@ records[1].paddingRuns;           // [{ startBits: 104, endBits: 128 }]
 No text is parsed on the JavaScript side. There is one `JSON.parse` and then
 field reads.
 
+Measured against the [@yowasp/clang](https://github.com/YoWASP/clang) bundle it
+replaces, on the same machine:
+
+| | stock clang | this |
+|---|---:|---:|
+| wasm | 75.5 MB | **28 MB** |
+| download (gzip) | 27 MB | **10.8 MB** |
+| instantiate | 329 ms | **107 ms** |
+| plain C query | 33 ms | **2 ms** |
+| C++ with `<string>` | 948 ms | **459 ms** |
+
+The per-query collapse is the library shape rather than the smaller binary: no
+process start, no driver, no argv parsing, and one `ASTContext` answering
+everything the driver needed six separate compiles for.
+
 ## Why this exists
 
 The usual way to get layout information out of clang in a browser is to run the
@@ -110,6 +125,14 @@ echo '{"triple":"x86_64-unknown-linux-gnu","source":"struct S{char a;int b;};"}'
 ```
 
 The wasm link is mechanical once the native build is clean.
+
+## Status
+
+Built, tested and driving [ABI Explorer](https://abiexplorer.org) end to end:
+its full browser suite passes on this module, in 45 s against the text
+pipeline's 1.1 min. `test/conformance.mjs` covers what the old pipeline got
+wrong or could not answer — base source ranges, flexible array members, empty
+members sharing an address, exotic triples, structured diagnostics.
 
 ## Using a local build in a web app
 
