@@ -7,14 +7,20 @@ on:
   pull_request:
   workflow_dispatch:
 
-# The toolchain build is the whole cost model here. Cold it is an LLVM
-# cross-compile — well over an hour. Warm it is `ninja` on one source file and
-# a link, which is seconds. So everything hangs on the cache key being exactly
-# the set of inputs that change the output: the pinned LLVM tag, the emsdk
-# version, and the cmake flags. Editing src/ or js/ must never miss the cache.
+# The toolchain build is the whole cost model here. Cold it is two LLVM builds,
+# native then cross-compiled to wasm — hours on a runner. Warm it is `ninja` on
+# one source file and a link, which is seconds. So everything hangs on the
+# caching, and it is arranged around two facts learned the hard way:
+#
+#   * A cold bootstrap does not fit in one run. It is therefore four steps with
+#     four caches, saved as each finishes, so a run that runs out of time banks
+#     what it did and the next one carries on. `bootstrap.sh <step>` exists for
+#     this.
+#   * A build whose value is the cache must not be cancelled. cancel-in-progress
+#     threw away two hours of LLVM because a later push wanted a turn.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -35,7 +41,8 @@ jobs:
           echo "emsdk=$EMSDK_VERSION" >> "$GITHUB_OUTPUT"
           hash="$(printf '%s' "$CMAKE_COMMON" | sha256sum | cut -c1-16)"
           echo "cmake_hash=$hash" >> "$GITHUB_OUTPUT"
-          echo "cache_key=toolchain-${{ runner.os }}-$LLVM_TAG-$EMSDK_VERSION-$hash" >> "$GITHUB_OUTPUT"
+          echo "native_key=llvm-native-${{ runner.os }}-$LLVM_TAG-$hash" >> "$GITHUB_OUTPUT"
+          echo "wasm_key=llvm-wasm-${{ runner.os }}-$LLVM_TAG-$EMSDK_VERSION-$hash" >> "$GITHUB_OUTPUT"
           echo "version=$(node -p "require('./js/package.json').version")" >> "$GITHUB_OUTPUT"
 
       - name: Free disk space
@@ -51,27 +58,70 @@ jobs:
 
       # restore/save rather than actions/cache, deliberately. actions/cache
       # skips its save step when the job fails — sensible for a cheap cache,
-      # ruinous for this one: a two-hour LLVM build was thrown away because a
-      # later step that takes seconds returned non-zero. The toolchain is
-      # correct or not on its own terms, so it is saved the moment it is built
-      # and never again depends on what happens after.
-      - name: Restore the toolchain
-        id: toolchain
+      # ruinous for this one: hours of LLVM thrown away because a later step
+      # that takes seconds returned non-zero. Each stage is correct or not on
+      # its own terms, so it is saved the moment it is built and never again
+      # depends on what happens after.
+      - name: Restore the LLVM source
+        id: src
         uses: actions/cache/restore@v4
         with:
-          path: ~/.cache/clang-abi-wasm
-          key: ${{ steps.meta.outputs.cache_key }}
-
-      - name: Bootstrap the toolchain (cold cache only)
-        if: steps.toolchain.outputs.cache-hit != 'true'
-        run: scripts/bootstrap.sh
-
-      - name: Save the toolchain
-        if: steps.toolchain.outputs.cache-hit != 'true'
+          path: ~/.cache/clang-abi-wasm/llvm-project
+          key: llvm-src-${{ steps.meta.outputs.llvm_tag }}
+      - if: steps.src.outputs.cache-hit != 'true'
+        run: scripts/bootstrap.sh source
+      - if: steps.src.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ~/.cache/clang-abi-wasm
-          key: ${{ steps.meta.outputs.cache_key }}
+          path: ~/.cache/clang-abi-wasm/llvm-project
+          key: llvm-src-${{ steps.meta.outputs.llvm_tag }}
+
+      - name: Restore the native LLVM
+        id: native
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/clang-abi-wasm/build-native
+          key: ${{ steps.meta.outputs.native_key }}
+      - if: steps.native.outputs.cache-hit != 'true'
+        run: scripts/bootstrap.sh native
+      - if: steps.native.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/clang-abi-wasm/build-native
+          key: ${{ steps.meta.outputs.native_key }}
+
+      - name: Restore the Emscripten SDK
+        id: emsdk
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/clang-abi-wasm/emsdk
+          key: emsdk-${{ steps.meta.outputs.emsdk }}
+      - if: steps.emsdk.outputs.cache-hit != 'true'
+        run: scripts/bootstrap.sh emsdk
+      - if: steps.emsdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/clang-abi-wasm/emsdk
+          key: emsdk-${{ steps.meta.outputs.emsdk }}
+
+      - name: Restore the wasm LLVM
+        id: wasm
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/clang-abi-wasm/build-wasm
+          key: ${{ steps.meta.outputs.wasm_key }}
+      - if: steps.wasm.outputs.cache-hit != 'true'
+        run: scripts/bootstrap.sh wasm
+      - if: steps.wasm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/clang-abi-wasm/build-wasm
+          key: ${{ steps.meta.outputs.wasm_key }}
+
+      # The stamps live beside the trees and are not part of any cache, so
+      # bootstrap.sh has to be told what a restore already provided.
+      - name: Mark the restored stages as current
+        run: scripts/bootstrap.sh --stamp-only
 
       - name: Build the module
         run: scripts/build.sh wasm

@@ -10,6 +10,14 @@
 # Every step is stamped and skipped when its inputs have not moved, so re-running
 # this is cheap and a failed run resumes rather than restarting. Nothing here
 # needs root, and nothing is installed outside $ABI_CACHE.
+#
+# One step at a time, for CI:
+#
+#   scripts/bootstrap.sh source|native|emsdk|wasm
+#
+# CI caches each step separately and runs them one call at a time, so a run that
+# runs out of time still banks the stages it finished. Locally, run it with no
+# arguments and it does all four.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,13 +25,42 @@ source "$REPO/scripts/config.sh"
 
 mkdir -p "$ABI_CACHE"
 JOBS="${JOBS:-$(nproc)}"
+ONLY="${1:-all}"
+want() { [[ "$ONLY" == all || "$ONLY" == "$1" ]]; }
 
-stamp()   { echo "$1" > "$ABI_CACHE/.stamp-$2"; }
-current() { [[ -f "$ABI_CACHE/.stamp-$2" && "$(cat "$ABI_CACHE/.stamp-$2")" == "$1" ]]; }
+# A step is current when its inputs hash to what the stamp records.
+#
+# Hashed rather than stored verbatim, and not for brevity: CMAKE_COMMON is a
+# multi-line value ending in a newline, `echo` adds another, and `$(cat)` strips
+# every trailing newline back off — so a stamp written from those inputs could
+# never equal them again. Every run rebuilt LLVM from scratch, warm cache and
+# all, and said "cached" nowhere to give it away.
+inputs()  { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+stamp()   { inputs "$1" > "$ABI_CACHE/.stamp-$2"; }
+current() {
+  [[ -f "$ABI_CACHE/.stamp-$2" ]] && [[ "$(cat "$ABI_CACHE/.stamp-$2")" == "$(inputs "$1")" ]]
+}
 step()    { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 
+# CI restores each stage from its own cache, and the stamps are not part of any
+# of them — they record what *this* checkout's config.sh asks for, which is
+# exactly what a restored tree cannot claim for itself. So after restoring,
+# stamp whatever is actually present and let the cache keys carry the identity:
+# they are built from the same inputs, so a tree restored under a matching key
+# is by definition the tree those inputs produce.
+if [[ "$ONLY" == --stamp-only ]]; then
+  [[ -d "$LLVM_SRC/llvm" ]]                && stamp "$LLVM_TAG" source
+  [[ -d "$NATIVE_BUILD/lib/cmake/clang" ]] && stamp "$LLVM_TAG$CMAKE_COMMON" native
+  [[ -f "$EMSDK_DIR/emsdk_env.sh" ]]       && stamp "$EMSDK_VERSION" emsdk
+  [[ -d "$WASM_BUILD/lib/cmake/clang" ]]   && stamp "$LLVM_TAG$CMAKE_COMMON$EMSDK_VERSION" wasm
+  step "Stamped the stages already present"
+  exit 0
+fi
+
 # --------------------------------------------------------------- 1. source --
-if current "$LLVM_TAG" source; then
+if ! want source; then
+  :
+elif current "$LLVM_TAG" source; then
   step "LLVM source at $LLVM_TAG — cached"
 else
   step "Fetching LLVM source ($LLVM_TAG)"
@@ -40,7 +77,9 @@ fi
 # --------------------------------------------------------------- 2. native --
 # Also the host build the wasm cross-compile borrows llvm-tblgen/clang-tblgen
 # from, so it is not optional even if you never run the native harness.
-if current "$LLVM_TAG$CMAKE_COMMON" native; then
+if ! want native; then
+  :
+elif current "$LLVM_TAG$CMAKE_COMMON" native; then
   step "Native LLVM — cached"
 else
   step "Building native LLVM/clang (backends off)"
@@ -55,7 +94,9 @@ else
 fi
 
 # ---------------------------------------------------------------- 3. emsdk --
-if current "$EMSDK_VERSION" emsdk; then
+if ! want emsdk; then
+  :
+elif current "$EMSDK_VERSION" emsdk; then
   step "Emscripten $EMSDK_VERSION — cached"
 else
   step "Installing Emscripten $EMSDK_VERSION"
@@ -66,10 +107,12 @@ else
   stamp "$EMSDK_VERSION" emsdk
 fi
 # shellcheck disable=SC1091
-source "$EMSDK_DIR/emsdk_env.sh" >/dev/null 2>&1
+[[ -d "$EMSDK_DIR" ]] && source "$EMSDK_DIR/emsdk_env.sh" >/dev/null 2>&1
 
 # ----------------------------------------------------------------- 4. wasm --
-if current "$LLVM_TAG$CMAKE_COMMON$EMSDK_VERSION" wasm; then
+if ! want wasm; then
+  :
+elif current "$LLVM_TAG$CMAKE_COMMON$EMSDK_VERSION" wasm; then
   step "wasm LLVM — cached"
 else
   step "Cross-building LLVM/clang for wasm"
@@ -94,6 +137,11 @@ else
   ninja -C "$WASM_BUILD" -j "$JOBS" clangFrontend clangDriver clangSerialization \
     clang-resource-headers
   stamp "$LLVM_TAG$CMAKE_COMMON$EMSDK_VERSION" wasm
+fi
+
+if [[ "$ONLY" != all ]]; then
+  step "Bootstrap step '$ONLY' complete"
+  exit 0
 fi
 
 step "Bootstrap complete"
