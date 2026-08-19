@@ -50,9 +50,28 @@ rsync -a \
 # ------------------------------------------------------------ musl libc --
 step "musl headers (per architecture)"
 MUSL_SRC="$ABI_CACHE/musl"
+# git.musl-libc.org is unreachable from some networks, so mirrors are tried in
+# turn. musl is an improvement, not a prerequisite: without it the module still
+# answers every question that does not reach a libc header, so a fetch failure
+# warns and carries on rather than failing the build.
+MUSL_OK=1
 if [[ ! -d "$MUSL_SRC" ]]; then
-  git clone --depth 1 https://git.musl-libc.org/git/musl "$MUSL_SRC"
+  MUSL_OK=0
+  for remote in \
+    https://git.musl-libc.org/git/musl \
+    https://github.com/kraj/musl.git \
+    https://github.com/esmil/musl.git
+  do
+    if git clone --depth 1 "$remote" "$MUSL_SRC" 2>/dev/null; then MUSL_OK=1; break; fi
+    echo "  musl: $remote unreachable, trying the next mirror" >&2
+  done
 fi
+if [[ "$MUSL_OK" != 1 ]]; then
+  echo "  WARNING: no musl mirror reachable — the pack will have no C library." >&2
+  echo "  Targets will still lay out records; anything including a libc header" >&2
+  echo "  will not resolve. Re-run when a mirror is available." >&2
+fi
+if [[ "$MUSL_OK" == 1 ]]; then
 # Copying musl's include/ is not enough: bits/alltypes.h does not exist in the
 # source tree. It is generated per architecture from alltypes.h.in plus that
 # arch's own template, so the headers have to be *installed*, once per arch.
@@ -60,6 +79,9 @@ fi
 mkdir -p "$OUT/include/musl-arch"
 for arch_dir in "$MUSL_SRC"/arch/*/; do
   arch="$(basename "$arch_dir")"
+  # `generic` is a shared overlay, not a target: it has no alltypes template of
+  # its own and musl's build rejects it as an ARCH.
+  [[ -f "$arch_dir/bits/alltypes.h.in" ]] || continue
   staged="$ABI_CACHE/musl-headers/$arch"
   if [[ ! -d "$staged/include" ]]; then
     make -C "$MUSL_SRC" install-headers ARCH="$arch" DESTDIR="$staged" prefix=/ >/dev/null
@@ -73,14 +95,67 @@ for arch_dir in "$MUSL_SRC"/arch/*/; do
   mkdir -p "$OUT/include/musl-arch/$arch"
   rsync -a "$staged/include/bits/" "$OUT/include/musl-arch/$arch/bits/"
 done
+fi
 
 # --------------------------------------------------------------- libc++ --
 step "libc++ headers"
 mkdir -p "$OUT/include/c++/v1"
-rsync -a --exclude '__support/' "$LLVM_SRC/libcxx/include/" "$OUT/include/c++/v1/" 2>/dev/null || {
+rsync -a --exclude '__support/' --exclude '*.in' --exclude 'CMakeLists.txt' \
+  "$LLVM_SRC/libcxx/include/" "$OUT/include/c++/v1/" 2>/dev/null || {
   echo "note: libcxx not in the sparse checkout; run:" >&2
   echo "  git -C $LLVM_SRC sparse-checkout add libcxx" >&2
 }
+
+# __config_site does not exist in the source tree: libc++'s build generates it
+# from __config_site.in, recording which options that build was configured with.
+# Every libc++ header includes it, so without it nothing C++ parses at all.
+#
+# These are the upstream defaults — what a plain `cmake` with no libc++ options
+# set produces, and what distributions therefore ship. They are not cosmetic:
+# _LIBCPP_ABI_VERSION and the ABI namespace decide the layout of every standard
+# type, so a layout viewer that reported them wrong would be wrong in exactly
+# the way that matters. Anyone needing a different configuration should
+# substitute their own build's __config_site here.
+cat > "$OUT/include/c++/v1/__config_site" <<'CONFIG'
+#ifndef _LIBCPP___CONFIG_SITE
+#define _LIBCPP___CONFIG_SITE
+
+#define _LIBCPP_ABI_VERSION 1
+#define _LIBCPP_ABI_NAMESPACE __1
+#define _LIBCPP_ABI_FORCE_ITANIUM 0
+#define _LIBCPP_ABI_FORCE_MICROSOFT 0
+#define _LIBCPP_HAS_THREADS 1
+#define _LIBCPP_HAS_MONOTONIC_CLOCK 1
+#define _LIBCPP_HAS_TERMINAL 1
+#define _LIBCPP_HAS_MUSL_LIBC 0
+#define _LIBCPP_HAS_THREAD_API_PTHREAD 0
+#define _LIBCPP_HAS_THREAD_API_EXTERNAL 0
+#define _LIBCPP_HAS_THREAD_API_WIN32 0
+#define _LIBCPP_HAS_THREAD_API_C11 0
+#define _LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS 0
+#define _LIBCPP_HAS_FILESYSTEM 1
+#define _LIBCPP_HAS_RANDOM_DEVICE 1
+#define _LIBCPP_HAS_LOCALIZATION 1
+#define _LIBCPP_HAS_UNICODE 1
+#define _LIBCPP_HAS_WIDE_CHARACTERS 1
+#define _LIBCPP_HAS_TIME_ZONE_DATABASE 1
+#define _LIBCPP_INSTRUMENTED_WITH_ASAN 0
+#define _LIBCPP_PSTL_BACKEND_SERIAL
+// Hardening: libc++'s own cmake defaults are mode "none" (2) and assertion
+// semantic "hardening_dependent" (2). The values are the bit constants from
+// __configuration/hardening.h, not ordinals.
+#define _LIBCPP_HARDENING_MODE_DEFAULT 2
+#define _LIBCPP_ASSERTION_SEMANTIC_DEFAULT 2
+#define _LIBCPP_LIBC_PICOLIBC 0
+#define _LIBCPP_LIBC_NEWLIB 0
+
+#endif // _LIBCPP___CONFIG_SITE
+CONFIG
+
+# __assertion_handler is the other generated header: libc++'s build copies a
+# vendor template into the include tree. LLVM's own default is the one to use.
+cp "$LLVM_SRC/libcxx/vendor/llvm/default_assertion_handler.in" \
+   "$OUT/include/c++/v1/__assertion_handler"
 
 # ----------------------------------------------------------------- done --
 printf '\n\033[1msysroot: %s\033[0m\n' "$OUT"

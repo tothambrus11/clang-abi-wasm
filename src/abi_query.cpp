@@ -157,14 +157,35 @@ public:
   std::vector<const RecordDecl *> Order;
   llvm::SmallPtrSet<const RecordDecl *, 32> Seen;
 
+  /// Without this, `std::string` is never visited: an implicit instantiation is
+  /// not part of the written declaration tree, so a field of that type would
+  /// reference a record that was never emitted and the id would dangle.
+  bool shouldVisitTemplateInstantiations() const { return true; }
+
   bool VisitRecordDecl(RecordDecl *RD) {
-    if (!RD->isCompleteDefinition() || RD->isInvalidDecl())
-      return true;
-    // Injected class names repeat the record inside itself.
-    if (RD->isImplicit())
+    if (!isLayoutable(RD))
       return true;
     if (Seen.insert(RD).second)
       Order.push_back(RD);
+    return true;
+  }
+
+  /// Can clang compute a record layout for this?
+  ///
+  /// The dependent check is not defensive: a template *pattern* is a complete,
+  /// valid definition whose members have dependent types, and asking
+  /// ASTContext::getASTRecordLayout for one walks into clang's layout builder
+  /// and segfaults there rather than returning an error. Visiting template
+  /// instantiations (which the ids require) makes the patterns reachable too,
+  /// so this is the guard that keeps them out.
+  static bool isLayoutable(const RecordDecl *RD) {
+    if (!RD || !RD->isCompleteDefinition() || RD->isInvalidDecl())
+      return false;
+    // Injected class names repeat the record inside itself.
+    if (RD->isImplicit())
+      return false;
+    if (RD->isDependentContext() || RD->isDependentType())
+      return false;
     return true;
   }
 };
@@ -184,16 +205,27 @@ public:
       if (IncludeSystem || isUserCode(RD))
         markReachable(RD);
 
+    // Emission order: source order for everything the traversal saw, then
+    // anything reachability pulled in that it did not. Reachability walks types
+    // and can reach a record the visitor never reported; emitting only the
+    // visited ones would leave `recordId` pointing at nothing.
+    std::vector<const RecordDecl *> Emit;
+    for (const RecordDecl *RD : All)
+      if (Reachable.count(RD))
+        Emit.push_back(RD);
+    llvm::SmallPtrSet<const RecordDecl *, 32> Listed(Emit.begin(), Emit.end());
+    for (const RecordDecl *RD : ReachedOrder)
+      if (!Listed.contains(RD))
+        Emit.push_back(RD);
+
     // Ids are indices into the emitted array, so a consumer resolves a
     // reference with `records[id]` and never searches by name.
-    for (const RecordDecl *RD : All)
-      if (Reachable.count(RD))
-        Ids[RD] = Ids.size();
+    for (const RecordDecl *RD : Emit)
+      Ids[RD] = Ids.size();
 
     llvm::json::Array Out;
-    for (const RecordDecl *RD : All)
-      if (Reachable.count(RD))
-        Out.push_back(emitRecord(RD));
+    for (const RecordDecl *RD : Emit)
+      Out.push_back(emitRecord(RD));
     return Out;
   }
 
@@ -202,6 +234,8 @@ private:
   const SourceManager &SM;
   bool IncludeSystem;
   llvm::SmallPtrSet<const RecordDecl *, 32> Reachable;
+  /// Reachability order, so records the traversal missed still emit predictably.
+  std::vector<const RecordDecl *> ReachedOrder;
   llvm::DenseMap<const RecordDecl *, unsigned> Ids;
 
   bool isUserCode(const RecordDecl *RD) const {
@@ -211,14 +245,28 @@ private:
 
   /// A reported record drags in the records it refers to, so every `recordId`
   /// in the output resolves.
-  void markReachable(const RecordDecl *RD) {
-    if (!RD || !RD->isCompleteDefinition() || !Reachable.insert(RD).second)
-      return;
-    if (const auto *CXX = dyn_cast<CXXRecordDecl>(RD))
-      for (const CXXBaseSpecifier &B : CXX->bases())
-        markReachable(B.getType()->getAsRecordDecl());
-    for (const FieldDecl *F : RD->fields())
-      markReachable(F->getType()->getAsRecordDecl());
+  ///
+  /// Iterative rather than recursive: with system records included, a libc++
+  /// translation unit reaches thousands of instantiations nested deeply enough
+  /// that the natural recursion overruns the stack.
+  void markReachable(const RecordDecl *Root) {
+    // Same rule as the collector: only records clang can actually lay out.
+    llvm::SmallVector<const RecordDecl *, 64> Work;
+    auto push = [&](const RecordDecl *RD) {
+      if (RecordCollector::isLayoutable(RD) && Reachable.insert(RD).second) {
+        ReachedOrder.push_back(RD);
+        Work.push_back(RD);
+      }
+    };
+    push(Root);
+    while (!Work.empty()) {
+      const RecordDecl *RD = Work.pop_back_val();
+      if (const auto *CXX = dyn_cast<CXXRecordDecl>(RD))
+        for (const CXXBaseSpecifier &B : CXX->bases())
+          push(B.getType()->getAsRecordDecl());
+      for (const FieldDecl *F : RD->fields())
+        push(F->getType()->getAsRecordDecl());
+    }
   }
 
   llvm::json::Value idOf(const RecordDecl *RD) const {
@@ -297,8 +345,14 @@ private:
       O["nonVirtualAlignBits"] = bits(L.getAlignment());
     }
 
-    // Track which bits are occupied so padding is reported, not inferred.
-    std::vector<bool> Occupied(size_t(bits(L.getSize())), false);
+    // Track which bits are occupied so padding is reported, not inferred. The
+    // scan costs one bit per bit of the record, so a type holding a large array
+    // is excluded rather than allowed to allocate without bound — no viewer
+    // draws a byte map at that size anyway.
+    const int64_t SizeBits = bits(L.getSize());
+    const int64_t PaddingScanLimit = 1 << 23; // 1 MB of record
+    const bool ScanPadding = SizeBits >= 0 && SizeBits <= PaddingScanLimit;
+    std::vector<bool> Occupied(ScanPadding ? size_t(SizeBits) : 0, false);
     auto occupy = [&](int64_t Start, int64_t Width) {
       for (int64_t B = std::max<int64_t>(Start, 0);
            B < std::min<int64_t>(Start + Width, (int64_t)Occupied.size()); ++B)
@@ -311,7 +365,7 @@ private:
 
     llvm::json::Array Runs;
     int64_t PaddingBits = 0;
-    for (size_t B = 0; B < Occupied.size();) {
+    for (size_t B = 0; ScanPadding && B < Occupied.size();) {
       if (Occupied[B]) { ++B; continue; }
       size_t Start = B;
       while (B < Occupied.size() && !Occupied[B]) ++B;
@@ -321,6 +375,10 @@ private:
     }
     O["paddingRuns"] = std::move(Runs);
     O["paddingBits"] = PaddingBits;
+    // Null rather than zero, so a consumer can tell "no padding" from "not
+    // computed for a record this large".
+    if (!ScanPadding)
+      O["paddingBits"] = nullptr;
 
     return llvm::json::Value(std::move(O));
   }
@@ -644,22 +702,28 @@ std::string runQuery(llvm::StringRef RequestJson) {
   const std::string ResourceDir =
       Req->getString("resourceDir").value_or(ABI_DEFAULT_RESOURCE_DIR).str();
 
+  // Order matters, and it is the reverse of the obvious one. Each layer reaches
+  // the next with #include_next, so the *most* derived must come first:
+  //
+  //   libc++       <cstddef> includes <stddef.h> and expects to find libc++'s
+  //                own wrapper, not clang's — put clang's first and libc++
+  //                stops the build saying exactly that
+  //   clang        its builtin <stddef.h> then include_next's to the C library
+  //   musl (arch)  target-varying declarations
+  //   musl         everything else
   if (!ResourceDir.empty()) {
     Args.push_back("-resource-dir=" + ResourceDir);
     Args.push_back("-nostdinc");
-    // clang's own builtin headers: stddef.h, stdint.h, the intrinsics.
+  }
+  if (IsCxx && !Sysroot.empty()) {
+    Args.push_back("-isystem");
+    Args.push_back(Sysroot + "/include/c++/v1");
+  }
+  if (!ResourceDir.empty()) {
     Args.push_back("-isystem");
     Args.push_back(ResourceDir + "/include");
   }
   if (!Sysroot.empty()) {
-    // libc++ before the C library: it reaches the C headers with #include_next,
-    // so anything that shadows them has to come first.
-    if (IsCxx) {
-      Args.push_back("-isystem");
-      Args.push_back(Sysroot + "/include/c++/v1");
-    }
-    // musl keeps the target-varying declarations in a per-architecture tree and
-    // the rest in a shared one; the architecture tree must win.
     Args.push_back("-isystem");
     Args.push_back(Sysroot + "/include/musl-arch/" + muslArch(Triple));
     Args.push_back("-isystem");

@@ -39,7 +39,7 @@ export function reset() {
  * @returns {Promise<AbiModule>}
  */
 async function instantiate(options) {
-  const base = options.baseUrl ? new URL(String(options.baseUrl), baseHref()) : undefined;
+  const base = normalizeBase(options.baseUrl);
 
   // The Emscripten glue is generated next to the .wasm and .data; letting it
   // resolve its own siblings keeps this working under any base path.
@@ -106,12 +106,41 @@ async function instantiate(options) {
 }
 
 /**
+ * A base the module's siblings can be resolved against, from either a URL or a
+ * plain directory path. Node callers pass a directory; browsers pass a URL, and
+ * the two need different joining — `new URL('a.wasm', '/tmp/dist')` silently
+ * resolves against the page origin rather than the directory.
+ *
+ * @param {string | URL | undefined} baseUrl
+ * @returns {string | undefined} a directory URL ending in '/'
+ */
+function normalizeBase(baseUrl) {
+  if (!baseUrl) return undefined;
+  const text = String(baseUrl);
+  const withSlash = text.endsWith('/') ? text : text + '/';
+  if (/^[a-z][a-z0-9+.-]*:/i.test(withSlash)) return new URL(withSlash, baseHref()).href;
+  // A filesystem path. Absolute becomes a file: URL; relative resolves against
+  // the current directory, which is what a Node caller means by it.
+  const absolute = withSlash.startsWith('/')
+    ? withSlash
+    : (typeof process !== 'undefined' ? process.cwd() : '') + '/' + withSlash;
+  return 'file://' + absolute;
+}
+
+/**
  * @param {string} path
- * @param {URL | undefined} base
+ * @param {string | undefined} base
  * @returns {string}
  */
 function resolve(path, base) {
-  return base ? new URL(path, base).href : path;
+  if (!base) return path;
+  const url = new URL(path, base).href;
+  // Emscripten opens the preloaded data package with the filesystem in Node, so
+  // hand it a path there rather than a file: URL it would try to fetch.
+  if (url.startsWith('file://') && typeof process !== 'undefined' && process.versions?.node) {
+    return decodeURIComponent(url.slice('file://'.length));
+  }
+  return url;
 }
 
 function baseHref() {

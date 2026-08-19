@@ -80,8 +80,12 @@ if(EMSCRIPTEN)
     -sEXPORT_NAME=createAbiModule
     -sENVIRONMENT=web,worker,node
     -sALLOW_MEMORY_GROWTH=1
-    # clang's recursive descent parser wants a real stack.
-    -sSTACK_SIZE=8MB
+    # clang's recursive descent parser wants a real stack, and walking every
+    # template instantiation in a libc++ translation unit wants considerably
+    # more than the parser alone: 8 MB traps on `includeSystemRecords` there.
+    -sSTACK_SIZE=64MB
+    -sINITIAL_MEMORY=512MB
+    -sMAXIMUM_MEMORY=4GB
     -sEXPORTED_FUNCTIONS=_abi_query,_abi_version,_malloc,_free
     -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,stringToNewUTF8,FS
     # The header pack is mounted at /usr/include; see scripts/package-headers.sh.
