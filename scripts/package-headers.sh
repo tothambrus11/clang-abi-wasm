@@ -37,7 +37,13 @@ step() { printf '\033[1m--> %s\033[0m\n' "$1"; }
 step "clang builtin + intrinsic headers"
 CLANG_RES="$(find "$WASM_BUILD/lib/clang" -maxdepth 2 -name include -type d | head -1)"
 [[ -d "$CLANG_RES" ]] || { echo "no clang resource dir under $WASM_BUILD/lib/clang" >&2; exit 1; }
-mkdir -p "$OUT/lib/clang/include"
+# Keep clang's own layout, version directory and all: the resource directory the
+# module is compiled to expect is lib/clang/<major>, and flattening it to
+# lib/clang/include puts the builtin headers somewhere nothing looks. That
+# failure hides on hosted targets, where musl supplies <stdint.h> anyway, and
+# only surfaces on a bare-metal one that has no libc to fall back to.
+CLANG_MAJOR="$(basename "$(dirname "$CLANG_RES")")"
+mkdir -p "$OUT/lib/clang/$CLANG_MAJOR/include"
 rsync -a \
   --exclude 'opencl-c*.h' \
   --exclude 'cuda_wrappers/' \
@@ -45,7 +51,7 @@ rsync -a \
   --exclude '__clang_hip*' \
   --exclude 'sanitizer/' \
   --exclude 'openmp_wrappers/' \
-  "$CLANG_RES/" "$OUT/lib/clang/include/"
+  "$CLANG_RES/" "$OUT/lib/clang/$CLANG_MAJOR/include/"
 
 # ------------------------------------------------------------ musl libc --
 step "musl headers (per architecture)"

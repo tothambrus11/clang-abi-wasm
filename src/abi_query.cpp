@@ -302,11 +302,23 @@ private:
 
   int64_t bits(CharUnits CU) const { return Ctx.toBits(CU); }
 
-  /// Size and alignment of a type, in bits. Incomplete types (the element type
-  /// of a flexible array member) have neither; they report zero rather than
-  /// tripping the assertion in getTypeInfo.
+  /// Size and alignment of a type, in bits.
+  ///
+  /// An incomplete type has no size and getTypeInfo asserts rather than saying
+  /// so, hence the guard. But `char data[]` is not simply unmeasurable: it
+  /// occupies nothing *and* is aligned like a `char`, so the element type
+  /// answers the alignment. Reporting zero for both would say a flexible array
+  /// member has no alignment, which is a different and wrong claim.
   std::pair<int64_t, int64_t> typeInfoBits(QualType T) const {
-    if (T->isIncompleteType() || T->isDependentType())
+    if (T->isDependentType())
+      return {0, 0};
+    if (const auto *IAT = Ctx.getAsIncompleteArrayType(T)) {
+      const QualType Elem = IAT->getElementType();
+      if (!Elem->isIncompleteType() && !Elem->isDependentType())
+        return {0, int64_t(Ctx.getTypeInfo(Elem).Align)};
+      return {0, 0};
+    }
+    if (T->isIncompleteType())
       return {0, 0};
     TypeInfo TI = Ctx.getTypeInfo(T);
     return {int64_t(TI.Width), int64_t(TI.Align)};
@@ -580,12 +592,24 @@ llvm::json::Value emitTargetInfo(const TargetInfo &TI,
       {"cxxAbi", T.isKnownWindowsMSVCEnvironment() ? "microsoft" : "itanium"}};
 }
 
-/// musl's per-architecture header tree for a triple, or "generic".
+/// musl's per-architecture header tree for a triple, or "" if it has none.
 ///
 /// The names are musl's own directory names, which mostly but not always match
-/// LLVM's architecture spelling.
+/// LLVM's architecture spelling. musl targets hosted systems, so it has nothing
+/// for AVR, MSP430, Xtensa and the rest of the bare-metal world — and that is
+/// the right answer for them rather than a gap: a freestanding target gets
+/// clang's freestanding headers, which define <stdint.h>, <stddef.h> and
+/// <limits.h> without a C library behind them.
 std::string muslArch(llvm::StringRef Triple) {
   const llvm::Triple T(Triple);
+  // musl is a Linux C library, and its headers encode Linux's data model. Used
+  // for a Windows target it answers `uint64_t` as `unsigned long`, which is
+  // four bytes there — the struct comes out 32 rather than 40 and nothing says
+  // why. Darwin and bare metal are the same story with different numbers, so
+  // everything that is not Linux gets clang's freestanding headers, which are
+  // defined per target and correct everywhere.
+  if (!T.isOSLinux())
+    return "";
   switch (T.getArch()) {
   case llvm::Triple::x86_64:   return T.isX32() ? "x32" : "x86_64";
   case llvm::Triple::x86:      return "i386";
@@ -607,9 +631,7 @@ std::string muslArch(llvm::StringRef Triple) {
   case llvm::Triple::systemz:  return "s390x";
   case llvm::Triple::loongarch64: return "loongarch64";
   case llvm::Triple::m68k:     return "m68k";
-  case llvm::Triple::wasm32:
-  case llvm::Triple::wasm64:   return "wasm32";
-  default:                     return "generic";
+  default:                     return "";
   }
 }
 
@@ -729,10 +751,17 @@ std::string runQuery(llvm::StringRef RequestJson) {
     Args.push_back(ResourceDir + "/include");
   }
   if (!Sysroot.empty()) {
-    Args.push_back("-isystem");
-    Args.push_back(Sysroot + "/include/musl-arch/" + muslArch(Triple));
-    Args.push_back("-isystem");
-    Args.push_back(Sysroot + "/include/musl");
+    // No musl tree for this target means no hosted C library, which is not a
+    // failure: clang's freestanding headers above already answer <stdint.h>
+    // and friends. Pointing at a tree that is not there would only turn a
+    // working bare-metal query into "bits/alltypes.h not found".
+    const std::string Arch = muslArch(Triple);
+    if (!Arch.empty()) {
+      Args.push_back("-isystem");
+      Args.push_back(Sysroot + "/include/musl-arch/" + Arch);
+      Args.push_back("-isystem");
+      Args.push_back(Sysroot + "/include/musl");
+    }
   }
   if (auto Std = Req->getString("std"); Std && !Std->empty())
     Args.push_back(("-std=" + *Std).str());

@@ -29,7 +29,7 @@ cat <<EOF
 
 Linked. In the app:
 
-  VITE_ABI_LOCAL=1 npm run dev
+  VITE_ABI=1 npm run dev
 
 Vite serves public/vendor/abi/ directly, so after
   scripts/build.sh wasm
