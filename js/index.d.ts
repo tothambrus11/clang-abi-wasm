@@ -333,6 +333,30 @@ export interface TargetInfo {
   isCharSigned: boolean;
 }
 
+/** What a query was answered against, when the answer depends on it. */
+export interface Headers {
+  /** The C library whose declarations were used; null when none was needed. */
+  cLibrary: 'musl' | null;
+  /**
+   * Which tree of it. An architecture name means musl's own headers, complete
+   * down to `struct stat`. `generic` means a target musl has no tree for —
+   * Windows, Darwin, anything bare-metal — served with musl's portable headers
+   * over types taken from the compiler's own macros, so every scalar is right
+   * for this target. That layer has no operating-system structures at all, so
+   * `<sys/stat.h>` there is a missing header rather than Linux's answer.
+   */
+  cLibraryArch: string | null;
+  cxxLibrary: 'libc++' | null;
+  /**
+   * False where libc++'s locale layer needs a platform C library we do not
+   * ship. `<string>`, `<vector>`, `<map>` and friends are unaffected;
+   * `<locale>` and `<iostream>` are not available.
+   */
+  localization: boolean;
+  /** False on targets with no operating system, as a bare-metal build would be. */
+  threads: boolean;
+}
+
 export interface AbiResponse {
   /** False only when the request itself was malformed (bad triple, bad JSON). */
   ok: boolean;
@@ -342,6 +366,8 @@ export interface AbiResponse {
   /** Non-zero if the TU had errors. Records may still be present and valid. */
   exitCode: number;
   target: TargetInfo;
+  /** How the standard headers were configured for this target. */
+  headers: Headers;
   diagnostics: Diagnostic[];
   /**
    * The same diagnostics as clang would have printed them: source excerpts,

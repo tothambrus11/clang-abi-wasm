@@ -259,6 +259,70 @@ check('a nested anonymous record says whose it is', () => {
   ok(pair && pair.isAnonymous && pair.parentRecordId === null, 'a typedef-ed record has no parent');
 });
 
+// ------------------------------------------------- the standard library --
+
+check('the C++ standard library resolves for every kind of target', () => {
+  const src = '#include <string>\n#include <vector>\n#include <map>\nstruct S { std::string s; std::vector<int> v; std::map<int,int> m; };';
+  for (const triple of [
+    'x86_64-unknown-linux-gnu',   // musl's own tree
+    'i386-unknown-linux-gnu',     // …and a 32-bit one
+    'x86_64-pc-windows-msvc',     // no MS runtime, no MS locale API
+    'aarch64-apple-macosx',       // no Darwin C library
+    'armv7-none-eabi',            // no operating system at all
+    'avr-unknown-unknown',        // 8-bit, 16-bit int
+    'sparcv9-sun-solaris',        // an OS libc++ has no threading branch for
+  ]) {
+    const res = query({ triple, lang: 'c++', std: 'gnu++20', source: src });
+    eq(res.exitCode, 0, `${triple}: ${res.diagnosticsText.slice(0, 400)}`);
+    ok(byName(res, 'S').sizeBits > 0, `${triple}: laid out`);
+  }
+});
+
+check('the C library types are the target\'s, whatever the target', () => {
+  // The bug this exists to prevent: serving one architecture's C headers to
+  // another. musl's x86_64 tree says `uint64_t` is `unsigned long`, which on
+  // Windows is four bytes — the struct came out 32 rather than 40.
+  const src = '#include <stdint.h>\nstruct S { uint64_t a; uint32_t b; uint64_t c; uint32_t d; uint64_t e; };';
+  for (const [triple, size] of [
+    ['x86_64-unknown-linux-gnu', 40],
+    ['x86_64-pc-windows-msvc', 40],
+    ['i386-unknown-linux-gnu', 32],
+    ['avr-unknown-unknown', 32],
+  ]) {
+    const res = query({ triple, source: src });
+    eq(res.exitCode, 0, `${triple}: ${res.diagnosticsText.slice(0, 200)}`);
+    eq(byName(res, 'S').sizeBits / 8, size, `sizeof(S) on ${triple}`);
+  }
+});
+
+check('an operating system we do not ship is a missing header, not a wrong answer', () => {
+  // Linux is real here — musl's tree is complete.
+  const linux = query({
+    triple: 'x86_64-unknown-linux-gnu',
+    source: '#include <sys/stat.h>\nstruct S { struct stat s; };',
+  });
+  eq(linux.exitCode, 0, 'struct stat on Linux');
+  ok(byName(linux, 'S').sizeBits > 0, 'and it has a size');
+  // Darwin's is not, and the generic layer does not pretend otherwise.
+  const mac = query({
+    triple: 'aarch64-apple-macosx',
+    source: '#include <sys/stat.h>\nstruct S { struct stat s; };',
+  });
+  ok(mac.exitCode !== 0, 'Darwin does not silently answer with Linux\'s struct');
+  ok(/file not found/.test(mac.diagnosticsText), 'and says why');
+});
+
+check('the response says what it was answered against', () => {
+  const linux = query({ triple: 'x86_64-unknown-linux-gnu', lang: 'c++', source: 'struct S{int x;};' });
+  eq(linux.headers.cLibrary, 'musl', 'C library');
+  eq(linux.headers.cLibraryArch, 'x86_64', 'its architecture');
+  eq(linux.headers.localization, true, 'localization on Linux');
+  const bare = query({ triple: 'armv7-none-eabi', lang: 'c++', source: 'struct S{int x;};' });
+  eq(bare.headers.cLibraryArch, 'generic', 'the generic layer');
+  eq(bare.headers.localization, false, 'no platform locale API');
+  eq(bare.headers.threads, false, 'no threads on a freestanding target');
+});
+
 // ---------------------------------------------------------------- names --
 
 check('type names are reported with what they resolve to', () => {

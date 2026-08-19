@@ -94,14 +94,41 @@ its reasoning; in short:
 
 | | |
 |---|---|
-| **kept** | clang builtin headers, target intrinsics (avx/neon/altivec), libc++, musl per architecture |
+| **kept** | clang builtin headers, target intrinsics (avx/neon/altivec), libc++, musl per architecture, a generic architecture layer |
 | **dropped** | static archives (`-fsyntax-only` never links), OpenCL, CUDA/HIP, sanitizer headers |
 
-musl is the notable addition. The stock bundle ships exactly one C library —
-wasi-libc — and uses it for every target, which means any 32-bit target fails
-outright on any libc header (`size_t` is hardcoded 64-bit) and
-`sizeof(struct stat)` comes back as wasi's number no matter what you asked for.
-musl is MIT, genuinely multi-arch, and fixes both.
+### The standard library, on any target
+
+Answering `sizeof(std::string)` means libc++ has to parse, and libc++ reaches
+for `<wchar.h>` and `<stdint.h>` wherever it runs. So a C library is not
+optional, and serving the wrong one is worse than serving none: musl's x86_64
+headers say `uint64_t` is `unsigned long`, which on Windows is four bytes, and
+the struct comes out 32 instead of 40 with nothing to say why.
+
+Three layers, chosen per target:
+
+| target | C declarations | what is available |
+|---|---|---|
+| Linux, an architecture musl supports | musl's own tree | everything, down to `struct stat` |
+| anything else | musl's portable headers over a **generic** `bits/` whose every type comes from the compiler's own macros | the standard C and C++ headers; no operating-system structures |
+| — | — | `<sys/stat.h>` on a Darwin target is a missing header, not Linux's answer |
+
+Two libc++ settings follow the target rather than the build, because they are
+not properties of a build: **localization** is off where libc++'s locale layer
+would need a platform C library we do not ship (so `<string>`, `<vector>` and
+`<map>` work everywhere while `<locale>` and `<iostream>` are Linux-only), and
+**threads** are off on targets with no operating system, which is what a real
+bare-metal build would say. Every response reports which of these applied,
+under `headers`.
+
+The result: `#include <string>` resolves on Linux, Windows, Darwin, iOS, WASI,
+Emscripten, Solaris, AVR, MSP430, Xtensa, Hexagon and bare-metal Arm and
+RISC-V — 23 of 23 targets in the conformance suite, where before it worked
+only on Linux.
+
+The MSVC standard library is deliberately absent: it is not redistributable.
+Windows targets get libc++ over the portable layer, which is a real answer to
+"what would libc++ do here" and not an answer to "what does MSVC's STL do".
 
 ## Building
 

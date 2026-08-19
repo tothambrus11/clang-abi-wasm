@@ -694,24 +694,32 @@ llvm::json::Value emitTargetInfo(const TargetInfo &TI,
       {"cxxAbi", T.isKnownWindowsMSVCEnvironment() ? "microsoft" : "itanium"}};
 }
 
-/// musl's per-architecture header tree for a triple, or "" if it has none.
+/// musl's per-architecture header tree for a triple.
 ///
 /// The names are musl's own directory names, which mostly but not always match
-/// LLVM's architecture spelling. musl targets hosted systems, so it has nothing
-/// for AVR, MSP430, Xtensa and the rest of the bare-metal world — and that is
-/// the right answer for them rather than a gap: a freestanding target gets
-/// clang's freestanding headers, which define <stdint.h>, <stddef.h> and
-/// <limits.h> without a C library behind them.
+/// LLVM's architecture spelling. Anything musl has no template for gets
+/// "generic": a tree that takes every type from the compiler's own macros, so
+/// it is correct for whatever target is being asked about.
+///
+/// The alternative, and what this used to do, was to serve no C library at all
+/// off Linux — which meant `#include <string>` failed outright on Windows,
+/// Darwin and every bare-metal target, because libc++ reaches for <wchar.h>
+/// and <stdint.h> wherever it runs. Serving *another* architecture's tree
+/// instead is worse than either: musl's x86_64 headers say `uint64_t` is
+/// `unsigned long`, which on Windows is four bytes, and the struct comes out
+/// 32 rather than 40 with nothing to say why.
+///
+/// musl's own trees are used where they apply, because they are complete:
+/// `struct stat` and the rest of the operating-system layer are real there.
+/// The generic tree has none of that, so asking about `struct stat` on a
+/// Darwin target fails to find a header rather than quietly answering with
+/// Linux's.
 std::string muslArch(llvm::StringRef Triple) {
   const llvm::Triple T(Triple);
-  // musl is a Linux C library, and its headers encode Linux's data model. Used
-  // for a Windows target it answers `uint64_t` as `unsigned long`, which is
-  // four bytes there — the struct comes out 32 rather than 40 and nothing says
-  // why. Darwin and bare metal are the same story with different numbers, so
-  // everything that is not Linux gets clang's freestanding headers, which are
-  // defined per target and correct everywhere.
+  // musl is a Linux C library and its headers encode Linux's structures, so
+  // its own trees serve Linux and nothing else.
   if (!T.isOSLinux())
-    return "";
+    return "generic";
   switch (T.getArch()) {
   case llvm::Triple::x86_64:   return T.isX32() ? "x32" : "x86_64";
   case llvm::Triple::x86:      return "i386";
@@ -733,8 +741,71 @@ std::string muslArch(llvm::StringRef Triple) {
   case llvm::Triple::systemz:  return "s390x";
   case llvm::Triple::loongarch64: return "loongarch64";
   case llvm::Triple::m68k:     return "m68k";
-  default:                     return "";
+  default:                     return "generic";
   }
+}
+
+/// How libc++ has to be configured for a target, and why.
+///
+/// A real __config_site records the one configuration a libc++ was built with.
+/// This module answers for hundreds of targets, and two of those settings are
+/// not properties of a build at all:
+///
+///   localization  libc++ picks its locale layer from the platform — Darwin's
+///                 xlocale, the Microsoft CRT's _locale_t, glibc/musl's. We
+///                 ship musl's, so anywhere else there is no locale API to
+///                 compile against. Off, rather than stubbed: a stub would
+///                 make <locale> parse and then answer about a type nobody
+///                 has. Everything that does not need a locale — string,
+///                 vector, map, shared_ptr, optional — is unaffected.
+///   threads       libc++ requires a threading API and knows how to pick one
+///                 for every operating system. A freestanding target has none,
+///                 and saying so is what a real bare-metal build would do.
+struct LibcxxConfig {
+  bool Localization = true;
+  bool Threads = true;
+  /// The MSVC runtime headers, which we do not ship and cannot.
+  bool VCRuntime = false;
+};
+
+/// Does libc++ know a threading API for this target?
+///
+/// Mirrors the list in libc++'s own __config: it picks pthreads for the
+/// operating systems it knows and the Win32 API on Windows, and #errors
+/// otherwise. Asking "does it have an OS" instead is close but not the same —
+/// Solaris has one and libc++ has no branch for it, which is a hard error
+/// rather than a fallback.
+bool libcxxHasThreadApi(const llvm::Triple &T) {
+  if (T.isOSWindows())
+    return true;
+  if (T.isOSDarwin())
+    return true;
+  switch (T.getOS()) {
+  case llvm::Triple::Linux:
+  case llvm::Triple::FreeBSD:
+  case llvm::Triple::NetBSD:
+  case llvm::Triple::OpenBSD:
+  case llvm::Triple::Fuchsia:
+  case llvm::Triple::WASI:
+  case llvm::Triple::Emscripten:
+  case llvm::Triple::AIX:
+  case llvm::Triple::ZOS:
+  case llvm::Triple::Hurd:
+    return true;
+  default:
+    return false;
+  }
+}
+
+LibcxxConfig libcxxConfigFor(llvm::StringRef Triple, llvm::StringRef Arch) {
+  const llvm::Triple T(Triple);
+  LibcxxConfig C;
+  // The locale layer needs the platform's own C library. That is exactly the
+  // case in which musl has a tree of its own.
+  C.Localization = Arch != "generic";
+  C.Threads = libcxxHasThreadApi(T);
+  C.VCRuntime = T.isKnownWindowsMSVCEnvironment();
+  return C;
 }
 
 std::string fail(llvm::StringRef Message) {
@@ -743,6 +814,7 @@ std::string fail(llvm::StringRef Message) {
                        {"clangVersion", clang::getClangFullVersion()},
                        {"exitCode", 1},
                        {"target", nullptr},
+                       {"headers", nullptr},
                        {"diagnostics", llvm::json::Array{}},
                        {"diagnosticsText", ""},
                        {"typedefs", llvm::json::Array{}},
@@ -854,18 +926,23 @@ std::string runQuery(llvm::StringRef RequestJson) {
     Args.push_back("-isystem");
     Args.push_back(ResourceDir + "/include");
   }
+  const std::string Arch = muslArch(Triple);
   if (!Sysroot.empty()) {
-    // No musl tree for this target means no hosted C library, which is not a
-    // failure: clang's freestanding headers above already answer <stdint.h>
-    // and friends. Pointing at a tree that is not there would only turn a
-    // working bare-metal query into "bits/alltypes.h not found".
-    const std::string Arch = muslArch(Triple);
-    if (!Arch.empty()) {
-      Args.push_back("-isystem");
-      Args.push_back(Sysroot + "/include/musl-arch/" + Arch);
-      Args.push_back("-isystem");
-      Args.push_back(Sysroot + "/include/musl");
-    }
+    Args.push_back("-isystem");
+    Args.push_back(Sysroot + "/include/musl-arch/" + Arch);
+    Args.push_back("-isystem");
+    Args.push_back(Sysroot + "/include/musl");
+  }
+  // libc++, configured for what this target actually has. Every value in
+  // __config_site is #ifndef-guarded so these win.
+  const LibcxxConfig LC = libcxxConfigFor(Triple, Arch);
+  if (IsCxx && !Sysroot.empty()) {
+    if (!LC.Localization)
+      Args.push_back("-D_LIBCPP_HAS_LOCALIZATION=0");
+    if (!LC.Threads)
+      Args.push_back("-D_LIBCPP_HAS_THREADS=0");
+    if (LC.VCRuntime)
+      Args.push_back("-D_LIBCPP_NO_VCRUNTIME");
   }
   if (auto Std = Req->getString("std"); Std && !Std->empty())
     Args.push_back(("-std=" + *Std).str());
@@ -914,6 +991,21 @@ std::string runQuery(llvm::StringRef RequestJson) {
       {"exitCode", (Ok && !CI.getDiagnostics().hasErrorOccurred()) ? 0 : 1},
       {"target", CI.hasTarget() ? emitTargetInfo(CI.getTarget(), Triple)
                                 : llvm::json::Value(nullptr)},
+      // What the answer was computed against. A consumer showing
+      // `sizeof(std::string)` for a Windows target should be able to say that
+      // the C declarations came from musl with this target's own scalar types,
+      // and that <locale> is not available here — rather than leave the
+      // difference to be discovered.
+      {"headers",
+       llvm::json::Object{
+           {"cLibrary", Sysroot.empty() ? llvm::json::Value(nullptr)
+                                        : llvm::json::Value("musl")},
+           {"cLibraryArch", Sysroot.empty() ? llvm::json::Value(nullptr)
+                                            : llvm::json::Value(Arch)},
+           {"cxxLibrary", (IsCxx && !Sysroot.empty()) ? llvm::json::Value("libc++")
+                                                      : llvm::json::Value(nullptr)},
+           {"localization", IsCxx && LC.Localization},
+           {"threads", IsCxx && LC.Threads}}},
       {"diagnostics", std::move(Diags->Diags)},
       // The same diagnostics as clang would have printed them. Rendering
       // compiler output — carets, source excerpts, colour — is clang's job,
