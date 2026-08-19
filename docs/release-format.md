@@ -20,8 +20,9 @@ Text compresses about 7:1, so header payload is cheap to *ship* and expensive to
 the whole session, whether or not the user ever writes C++.
 
 That splits the decision cleanly. Bandwidth is not the reason to leave anything
-out — so nothing is left out, and offline works. Memory is, so what gets
-*mounted* is decided at load, not at packaging.
+out — so nothing is left out, and offline works. Memory would be a reason to
+*mount* less than is shipped, which is a separate lever and one this format does
+not yet pull; see "Not yet" below.
 
 ## Artifacts
 
@@ -29,12 +30,13 @@ A release is these files and nothing else:
 
 ```
 manifest.json                     mutable, tiny, the only thing fetched by name
-abi_query-<hash>.wasm             the frontend-only clang
-abi_query-<hash>.mjs              Emscripten glue
-core-<hash>.pack                  clang builtins + intrinsics + musl   (~7 MB raw)
-cxx-<hash>.pack                   libc++                               (~12 MB raw)
+wasm-<hash>.wasm                  the frontend-only clang        28 MB  (8.8 MB gzip)
+glue-<hash>.mjs                   Emscripten glue               311 kB  (58 kB gzip)
+headers-<hash>.data               the whole header payload       20 MB  (2.4 MB gzip)
 index.mjs, index.d.ts             the JS API and its contract
 ```
+
+10.8 MB over the wire, once.
 
 Everything but the manifest is content-addressed, so everything but the manifest
 is immutable: `Cache-Control: public, max-age=31536000, immutable`. No
@@ -46,59 +48,45 @@ bump the LLVM tag without touching headers and clients refetch only the wasm.
 ```json
 {
   "schemaVersion": 1,
+  "version": "0.1.0+llvm22.1.8",
   "clang": "22.1.8",
-  "built": "2026-08-19T18:50:00Z",
-  "inputs": { "llvmTag": "llvmorg-22.1.8", "emsdk": "4.0.3", "cmakeHash": "9f2c…" },
+  "built": "2026-08-19T23:14:32Z",
+  "inputs": { "llvmTag": "llvmorg-22.1.8", "emsdk": "6.0.7", "cmakeHash": "aa3b58175e47512f" },
   "files": {
-    "wasm":  { "path": "abi_query-4a1c….wasm", "bytes": 0,       "gzip": 0 },
-    "glue":  { "path": "abi_query-4a1c….mjs",  "bytes": 0,       "gzip": 0 },
-    "core":  { "path": "core-8b3e….pack",      "bytes": 7340032, "gzip": 1100000 },
-    "cxx":   { "path": "cxx-2d90….pack",       "bytes": 12582912,"gzip": 1782579 }
+    "wasm":    { "path": "wasm-9ec58989c571.wasm",    "sha256": "…", "bytes": 29233966, "gzip": 8837850 },
+    "glue":    { "path": "glue-2459f7a19378.mjs",     "sha256": "…", "bytes": 317681,   "gzip": 58385 },
+    "headers": { "path": "headers-95122c0f5c56.data", "sha256": "…", "bytes": 20119812, "gzip": 2431096 }
   }
 }
 ```
 
 `inputs` is what makes a build reproducible and a cache key honest: the LLVM tag,
 the emsdk version, and a hash of the cmake flags are the only things that change
-the output, and they are the CI cache key too.
+the output, and they are the CI cache key too. `sha256` is what a consumer
+verifies a download against — `tools/fetch-abi-module.mjs` in the web app does,
+and skips a file whose hash already matches on disk.
 
-## Why two packs and not one
+The header payload is Emscripten's `--preload-file` bundle: one `.data` blob,
+fetched with the module and mounted whole.
 
-`core` is everything a C question needs — clang's builtin headers, the target
-intrinsics, musl for every architecture. `cxx` is libc++ alone.
+## Not yet: splitting the header payload
 
-The split is not about download size (1.7 MB either way). It is that a C user
-should not carry 12 MB of parsed headers in the module's heap for a session they
-spend writing structs. Mounting `cxx` is deferred to the first C++ request.
+The 20 MB of headers is 12 MB of libc++ and 8 MB of everything a C question
+needs. Mounting costs the full uncompressed size in the module's heap, for the
+session, whether or not the user ever writes C++ — so a C-only session pays 12
+MB of heap for nothing.
 
-Offline still holds, because deferred is not the same as lazy:
+Splitting it in two would fix that, and the split would not be lazy: `load()`
+would fetch and mount the C half, resolve, then fetch the C++ half into the
+Cache API in the background, so it is local before anyone selects C++ and the
+next visit is offline-ready either way.
 
-1. `load()` fetches the manifest, wasm and `core`, and resolves.
-2. The moment it resolves it starts fetching `cxx` in the background and puts it
-   in the Cache API — the user is reading their first layout while it lands.
-3. Mounting happens on the first C++ query, from cache, with no network.
-
-By the time anyone selects C++ the bytes are local. The pack is cached even if
-this session never mounts it, so the *next* session is offline-ready too. An
-app that would rather pay upfront passes `{ eager: ['cxx'] }` and gets both
-mounted before `load()` resolves.
-
-## Pack format
-
-A pack is a tar, brotli-compressed, with a header naming its mount point:
-
-```
-<u32 magic 'ABIP'><u32 version><u32 jsonLen><json header><brotli tar stream>
-```
-
-Deliberately not Emscripten's `--preload-file`. That produces one `.data` blob
-tied to the glue, fetched eagerly and in full, with no way to split or to cache
-the halves separately — which is exactly the flexibility this design needs. The
-tar is decompressed with `DecompressionStream('br')` where available and mounted
-into MEMFS; there is no third-party decompressor in the bundle.
-
-Both packs are stored decompressed by the browser only in the module's heap; the
-Cache API holds the compressed bytes.
+It is not done, and this is what it would take: `--preload-file` produces one
+blob tied to the glue, with no way to split it or cache the halves separately,
+so it would mean a pack format of our own (a brotli tar with a header naming its
+mount point, decompressed with `DecompressionStream('br')` and mounted into
+MEMFS) and a loader to match. Worth doing when heap pressure is the complaint;
+it buys nothing over the wire, and download size is what people notice first.
 
 ## Distribution
 
@@ -109,7 +97,7 @@ Cache API holds the compressed bytes.
 | **self-host** | copy the release directory anywhere and point `baseUrl` at it |
 
 npm serves gzip only, which costs about 20% against brotli on these files — a
-reason to prefer the release URL for the packs and npm for the JS, but not a
+reason to prefer the release URL for the payload and npm for the JS, but not a
 reason to complicate the default. `load()` takes `baseUrl` precisely so an app
 can decide.
 
@@ -153,14 +141,16 @@ is: carry anything cheap enough that fetching it later would be the worse trade.
 
 ## Open questions
 
-- **Brotli in the pack, or leave it to transport?** Content-encoding is simpler
-  and lets a CDN negotiate, but breaks the "same file works from a `file://`
-  directory" property. Currently compressed in the pack; revisit if a CDN in
-  front makes transport encoding reliable.
-- **Is `core` still too big for a first paint?** The intrinsics are the bulk of
-  it. If measurement says yes, they split out as a third pack on the same
-  background-fetch rule rather than becoming lazy.
+- **Brotli in the payload, or leave it to transport?** Content-encoding is
+  simpler and lets a CDN negotiate, but breaks the "same file works from a
+  `file://` directory" property. Currently neither: the `.data` blob is raw and
+  the 2.4 MB figure is what gzip transport achieves. Revisit together with the
+  split above, which needs a container format anyway.
 - **Per-target header subsetting.** musl's arch trees are mostly disjoint;
-  shipping one arch would cut the pack, at the cost of a fetch on every target
-  switch. Almost certainly not worth it — the whole of musl is about a megabyte
-  — but it is the obvious next lever if `core` needs to shrink.
+  shipping one arch would cut the payload, at the cost of a fetch on every
+  target switch. Almost certainly not worth it — the whole of musl is about a
+  megabyte, and the generic layer means every target needs at most two trees —
+  but it is the obvious lever if the payload has to shrink.
+- **The intrinsic headers are 5.2 MB of the 20.** avx/neon/altivec appear in
+  real code often enough to keep, but they are the largest single thing a
+  layout query rarely reaches. The first candidate to move behind the split.

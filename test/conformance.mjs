@@ -263,18 +263,54 @@ check('a nested anonymous record says whose it is', () => {
 
 check('the C++ standard library resolves for every kind of target', () => {
   const src = '#include <string>\n#include <vector>\n#include <map>\nstruct S { std::string s; std::vector<int> v; std::map<int,int> m; };';
-  for (const triple of [
-    'x86_64-unknown-linux-gnu',   // musl's own tree
-    'i386-unknown-linux-gnu',     // …and a 32-bit one
-    'x86_64-pc-windows-msvc',     // no MS runtime, no MS locale API
-    'aarch64-apple-macosx',       // no Darwin C library
-    'armv7-none-eabi',            // no operating system at all
-    'avr-unknown-unknown',        // 8-bit, 16-bit int
-    'sparcv9-sun-solaris',        // an OS libc++ has no threading branch for
-  ]) {
+  // Every family the header layers have to cover: musl's own trees, the ones
+  // it has none for, the operating systems libc++ knows and the ones it does
+  // not, and the targets whose int is not 32 bits. Before the generic layer
+  // this list was "Linux".
+  const TRIPLES = [
+    'x86_64-unknown-linux-gnu',    // musl's own tree
+    'i386-unknown-linux-gnu',      // …and a 32-bit one, which used to get 64-bit types
+    'aarch64-unknown-linux-gnu',
+    'mips-unknown-linux-gnu',
+    'powerpc64le-unknown-linux-gnu',
+    's390x-unknown-linux-gnu',
+    'x86_64-pc-windows-msvc',      // no MS runtime, no MS locale API
+    'aarch64-pc-windows-msvc',
+    'i686-pc-windows-gnu',
+    'aarch64-apple-macosx',        // no Darwin C library
+    'x86_64-apple-darwin',
+    'arm64-apple-ios',
+    'wasm32-unknown-emscripten',
+    'wasm32-wasi',
+    'sparcv9-sun-solaris',         // an OS libc++ has no threading branch for
+    'armv7-none-eabi',             // no operating system at all
+    'riscv32-unknown-elf',
+    'riscv64-unknown-elf',
+    'xtensa-none-elf',
+    'hexagon-unknown-elf',
+    'bpfel-unknown-none',
+    'avr-unknown-unknown',         // 8-bit, and its int is 16 bits
+    'msp430-none-elf',
+  ];
+  for (const triple of TRIPLES) {
     const res = query({ triple, lang: 'c++', std: 'gnu++20', source: src });
     eq(res.exitCode, 0, `${triple}: ${res.diagnosticsText.slice(0, 400)}`);
     ok(byName(res, 'S').sizeBits > 0, `${triple}: laid out`);
+  }
+  // A pointer-sized answer on every one of them, which is what says the types
+  // came from the target rather than from whichever tree was handy.
+  for (const [triple, bytes] of [
+    ['x86_64-unknown-linux-gnu', 24],
+    ['i386-unknown-linux-gnu', 12],
+    ['avr-unknown-unknown', 6],
+  ]) {
+    const res = query({
+      triple,
+      lang: 'c++',
+      std: 'gnu++20',
+      source: '#include <string>\nstruct S { std::string s; };',
+    });
+    eq(byName(res, 'S').sizeBits / 8, bytes, `sizeof(std::string) on ${triple}`);
   }
 });
 
