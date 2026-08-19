@@ -48,7 +48,9 @@ translation unit again, up to four times over as candidate spellings failed.
 `ASTContext::getTypeInfo` answers the same question from the AST already in
 memory.
 
-The measurements behind the decision are in [`docs/why-frontend-only.md`](docs/why-frontend-only.md).
+The measurements behind the decision are in
+[`docs/why-frontend-only.md`](docs/why-frontend-only.md); how a release is cut and
+delivered is in [`docs/release-format.md`](docs/release-format.md).
 
 ## The build is frontend-only
 

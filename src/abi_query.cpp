@@ -27,6 +27,7 @@
 #include "clang/Basic/Version.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/CompilerInvocation.h"
+#include "clang/Driver/CreateInvocationFromArgs.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Lex/PreprocessorOptions.h"
 
@@ -90,10 +91,14 @@ public:
     }
 
     // The flag that controls the diagnostic, so a UI can offer to turn it off.
-    llvm::StringRef Opt =
-        DiagnosticIDs::getWarningOptionForDiag(Info.getID());
-    D["option"] = Opt.empty() ? llvm::json::Value(nullptr)
-                              : llvm::json::Value(("-W" + Opt).str());
+    if (const DiagnosticsEngine *Engine = Info.getDiags()) {
+      llvm::StringRef Opt =
+          Engine->getDiagnosticIDs()->getWarningOptionForDiag(Info.getID());
+      D["option"] = Opt.empty() ? llvm::json::Value(nullptr)
+                                : llvm::json::Value(("-W" + Opt).str());
+    } else {
+      D["option"] = nullptr;
+    }
 
     Diags.push_back(std::move(D));
   }
@@ -140,7 +145,7 @@ public:
 class RecordCollector : public RecursiveASTVisitor<RecordCollector> {
 public:
   std::vector<const RecordDecl *> Order;
-  llvm::SmallPtrSet<const RecordDecl *, 64> Seen;
+  llvm::SmallPtrSet<const RecordDecl *, 32> Seen;
 
   bool VisitRecordDecl(RecordDecl *RD) {
     if (!RD->isCompleteDefinition() || RD->isInvalidDecl())
@@ -186,7 +191,7 @@ private:
   ASTContext &Ctx;
   const SourceManager &SM;
   bool IncludeSystem;
-  llvm::SmallPtrSet<const RecordDecl *, 64> Reachable;
+  llvm::SmallPtrSet<const RecordDecl *, 32> Reachable;
   llvm::DenseMap<const RecordDecl *, unsigned> Ids;
 
   bool isUserCode(const RecordDecl *RD) const {
@@ -258,7 +263,7 @@ private:
     O["kind"] = kindName(RD);
     O["name"] = RD->getNameAsString();
     O["qualifiedName"] = RD->getQualifiedNameAsString();
-    O["printedName"] = printed(Ctx.getRecordType(RD));
+    O["printedName"] = printed(Ctx.getCanonicalTagType(RD));
     O["isAnonymous"] = RD->getDeclName().isEmpty();
     O["isUserCode"] = isUserCode(RD);
     O["location"] = JsonDiagnostics::locationToJson(SM, RD->getLocation());
@@ -499,7 +504,6 @@ llvm::json::Value emitTargetInfo(const TargetInfo &TI,
       {"intSizeBits", int64_t(TI.getIntWidth())},
       {"longSizeBits", int64_t(TI.getLongWidth())},
       {"longLongSizeBits", int64_t(TI.getLongLongWidth())},
-      {"isCharSigned", TI.isCharSigned()},
       {"cxxAbi", T.isKnownWindowsMSVCEnvironment() ? "microsoft" : "itanium"}};
 }
 
@@ -525,10 +529,10 @@ std::string fail(llvm::StringRef Message) {
 /// exotic triples). So the list is produced the only way it can be: by asking
 /// TargetInfo to construct one per architecture and keeping those that work.
 std::string listTargets() {
-  auto DiagOpts = llvm::makeIntrusiveRefCnt<DiagnosticOptions>();
+  DiagnosticOptions DiagOpts;
   auto DiagIDs = llvm::makeIntrusiveRefCnt<DiagnosticIDs>();
   IgnoringDiagConsumer Ignore;
-  DiagnosticsEngine DE(DiagIDs, *DiagOpts, &Ignore, /*ShouldOwnClient=*/false);
+  DiagnosticsEngine DE(DiagIDs, DiagOpts, &Ignore, /*ShouldOwnClient=*/false);
 
   llvm::json::Array Targets;
   for (unsigned A = llvm::Triple::UnknownArch + 1;
@@ -577,7 +581,11 @@ std::string runQuery(llvm::StringRef RequestJson) {
   const bool IncludeSystem =
       Req->getBoolean("includeSystemRecords").value_or(false);
 
-  std::vector<std::string> Args{"-fsyntax-only",
+  // Driver-level arguments, translated to a cc1 invocation below. Taking driver
+  // flags rather than cc1 flags means callers pass what they would type, and
+  // the driver applies the target's own header search and defaults.
+  std::vector<std::string> Args{"clang",
+                                "-fsyntax-only",
                                 "--target=" + Triple,
                                 IsCxx ? "-xc++" : "-xc"};
   if (auto Std = Req->getString("std"); Std && !Std->empty())
@@ -594,17 +602,23 @@ std::string runQuery(llvm::StringRef RequestJson) {
     Argv.push_back(A.c_str());
 
   auto Diags = std::make_unique<JsonDiagnostics>();
-  auto DiagOpts = llvm::makeIntrusiveRefCnt<DiagnosticOptions>();
+  DiagnosticOptions DiagOpts;
   auto DiagIDs = llvm::makeIntrusiveRefCnt<DiagnosticIDs>();
-  DiagnosticsEngine DE(DiagIDs, *DiagOpts, Diags.get(), /*ShouldOwnClient=*/false);
+  DiagnosticsEngine DE(DiagIDs, DiagOpts, Diags.get(), /*ShouldOwnClient=*/false);
 
-  auto Invocation = std::make_shared<CompilerInvocation>();
-  if (!CompilerInvocation::CreateFromArgs(*Invocation, Argv, DE))
+  // The driver turns `--target=... -xc++ -std=...` into the cc1 arguments the
+  // frontend actually consumes. CreateFromArgs alone would reject these: it
+  // parses cc1 flags, not driver flags.
+  CreateInvocationOptions IOpts;
+  IOpts.Diags = llvm::makeIntrusiveRefCnt<DiagnosticsEngine>(
+      DiagIDs, DiagOpts, Diags.get(), /*ShouldOwnClient=*/false);
+  IOpts.RecoverOnError = true;
+  std::shared_ptr<CompilerInvocation> Invocation = createInvocation(Argv, IOpts);
+  if (!Invocation)
     return fail("could not build a compiler invocation for target " + Triple);
 
   CompilerInstance CI(std::move(Invocation));
-  CI.createDiagnostics(*llvm::vfs::getRealFileSystem(), Diags.get(),
-                       /*ShouldOwnClient=*/false);
+  CI.createDiagnostics(Diags.get(), /*ShouldOwnClient=*/false);
 
   // The source lives in memory; nothing is read from or written to a real path.
   CI.getPreprocessorOpts().addRemappedFile(

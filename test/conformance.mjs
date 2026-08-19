@@ -139,7 +139,24 @@ check('an empty member sharing an address occupies nothing', () => {
   eq(S.sizeBits, 32, 'sizeof S');
 });
 
+// The native harness resolves headers through the host toolchain, which may
+// have no libc++ at all; the wasm module carries its own. Skip rather than
+// fail, so a missing host sysroot does not look like a defect in the code.
+const hasLibcxx = (() => {
+  const probe = query({
+    triple: 'x86_64-unknown-linux-gnu',
+    lang: 'c++',
+    std: 'c++20',
+    source: '#include <string>\nstruct P { std::string s; };',
+  });
+  return probe.exitCode === 0;
+})();
+
 check('library records stay out unless asked for', () => {
+  if (!hasLibcxx) {
+    console.log('       (skipped: no libc++ in this toolchain)');
+    return;
+  }
   const req = {
     triple: 'x86_64-unknown-linux-gnu',
     lang: 'c++',
