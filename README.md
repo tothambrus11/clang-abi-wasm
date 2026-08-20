@@ -172,13 +172,21 @@ parsing, probe generation, AST-location matching and containment reconstruction
 were deleted, and its browser suite runs in 51 s against the text pipeline's
 1.1 min.
 
-`test/differential.mjs` is the check that does not grade its own work:
-it generates record declarations, asks the module, then compiles the same
-declarations with the runner's own **gcc** and compares `sizeof`, `alignof`,
-every member offset and every base offset. Nothing else here would catch a
-systematic misreading of clang's API — bits reported as bytes, a base placed
-wrong — because both sides of every other comparison come from the same source.
-1,999 facts over 500 programs currently agree exactly; CI runs 400.
+`test/differential.mjs` is the check that does not grade its own work: it
+generates record declarations, asks the module, then puts the same declarations
+to the runner's own **gcc** and compares `sizeof`, `alignof`, every member
+offset and every base offset. Nothing else here would catch a systematic
+misreading of clang's API — bits reported as bytes, a base placed wrong —
+because both sides of every other comparison come from the same source.
+
+Two ABIs, two mechanisms. On the host it compiles and *runs* a program that
+prints the numbers, which is the only way to check a base subobject's offset
+(pointer arithmetic, not `offsetof`). For 32-bit it emits `_Static_assert`s of
+the module's numbers and asks `gcc -m32 -fsyntax-only` to agree — no linker, no
+run, so it works on a machine with no 32-bit libraries, and 32-bit is exactly
+where a wrong `size_t` hides.
+
+About 2,400 facts per 300 programs currently agree exactly; CI runs 400.
 
 `test/conformance.mjs` — 23 checks — covers what the old pipeline got wrong or
 could not answer: base specifier source ranges, flexible array members, empty

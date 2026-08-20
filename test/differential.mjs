@@ -54,11 +54,24 @@ if (existsSync(WASM)) {
   process.exit(2);
 }
 
-// The host's own triple. Comparing against gcc only means anything for the
-// target gcc is: everything else it cannot answer for.
+// The host's own triple, and the 32-bit one beside it. Comparing against gcc
+// only means anything for a target gcc can answer for.
 const HOST = execFileSync('gcc', ['-dumpmachine']).toString().trim();
+/** Can gcc at least *parse* for 32-bit here? It needs no libraries to do that. */
+const HAS_M32 = (() => {
+  const probe = path.join(os.tmpdir(), `abi-m32-${process.pid}.c`);
+  try {
+    writeFileSync(probe, 'int x;\n');
+    execFileSync('gcc', ['-m32', '-fsyntax-only', probe], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probe, { force: true });
+  }
+})();
 console.log(`comparing against ${execFileSync('gcc', ['--version']).toString().split('\n')[0]}`);
-console.log(`target: ${HOST}\n`);
+console.log(`targets: ${HOST}${HAS_M32 ? ' and i386-linux-gnu (-m32)' : ''}\n`);
 
 // --------------------------------------------------------------- generator --
 
@@ -231,6 +244,62 @@ function askCompiler(source, decls, cxx) {
   return facts;
 }
 
+/**
+ * Have gcc check the module's numbers instead of reporting its own.
+ *
+ * `_Static_assert` needs neither a linker nor a run, so this works for any ABI
+ * gcc can parse for — including `-m32` on a machine with no 32-bit libraries,
+ * which is the data model where a wrong `size_t` hides. Sizes, alignments and
+ * member offsets only: a base's offset is not a constant expression.
+ */
+function assertAgainstCompiler(source, decls, cxx, triple, flags) {
+  const res = query({
+    triple,
+    source,
+    lang: cxx ? 'c++' : 'c',
+    std: cxx ? 'gnu++20' : 'gnu17',
+  });
+  if (res.exitCode !== 0) {
+    throw new Error(`module: ${res.diagnosticsText.replace(/\x1b\[[0-9;]*m/g, '').slice(0, 300)}`);
+  }
+  const claims = [];
+  const assert = cxx ? 'static_assert' : '_Static_assert';
+  for (const d of decls) {
+    const r = res.records.find((x) => x.name === d.name);
+    if (!r) throw new Error(`module did not report ${d.name}`);
+    claims.push(
+      `${assert}(sizeof(${d.spelling}) == ${r.sizeBits / 8}, "${d.name} size");`,
+      `${assert}(_Alignof_(${d.spelling}) == ${r.alignBits / 8}, "${d.name} align");`,
+    );
+    for (const f of r.fields) {
+      if (f.isBitField || !f.name || !d.members.includes(f.name)) continue;
+      claims.push(
+        `${assert}(__builtin_offsetof(${d.spelling}, ${f.name}) == ${f.offsetBits / 8},` +
+          ` "${d.name}.${f.name}");`,
+      );
+    }
+  }
+  const alignOf = cxx ? '#define _Alignof_(T) alignof(T)' : '#define _Alignof_(T) _Alignof(T)';
+  const program = `${alignOf}\n${source}\n${claims.join('\n')}\n`;
+  const file = path.join(tmp, cxx ? 'a.cc' : 'a.c');
+  writeFileSync(file, program);
+  try {
+    execFileSync(cxx ? 'g++' : 'gcc', [
+      ...flags,
+      cxx ? '-std=gnu++20' : '-std=gnu17',
+      '-w',
+      '-fsyntax-only',
+      file,
+    ]);
+  } catch (e) {
+    const said = (e.stderr?.toString() ?? '').split('\n').filter((l) => l.includes('assert'));
+    // gcc could not parse it at all — a generator artefact, not a finding.
+    if (!said.length) return { skipped: true, claims: claims.length };
+    return { failed: said.slice(0, 3).join('\n'), source, claims: claims.length };
+  }
+  return { claims: claims.length };
+}
+
 /** The same facts, from the module. */
 function askModule(source, decls, cxx) {
   const res = query({
@@ -286,6 +355,18 @@ try {
       console.log(`\nFAIL (${cxx ? 'c++' : 'c'}) ${e.message}\n${source}`);
       continue;
     }
+    // The same declarations, checked by gcc for a second ABI it can parse but
+    // not link for.
+    if (HAS_M32) {
+      const r = assertAgainstCompiler(source, decls, cxx, 'i386-unknown-linux-gnu', ['-m32']);
+      if (r.failed) {
+        mismatches++;
+        console.log(`\nFAIL (-m32)\n${r.failed}\n${r.source}`);
+      } else if (!r.skipped) {
+        checked += r.claims;
+      }
+    }
+
     for (const [key, expected] of theirs) {
       if (!mine.has(key)) {
         skipped.set(key.split('|')[1], (skipped.get(key.split('|')[1]) ?? 0) + 1);
