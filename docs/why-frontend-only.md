@@ -98,3 +98,25 @@ header — it is a confident wrong answer.
 
 musl is MIT, genuinely multi-arch, and about a megabyte. See
 `scripts/package-headers.sh`.
+
+### …and how it came back
+
+Shipping musl per architecture did not, on its own, fix it. musl generates
+`bits/alltypes.h` into an `obj/` directory with no architecture in its path, and
+`make` will not regenerate a file whose template is older than it — so
+installing headers for nineteen architectures in a row gave all nineteen the
+*first* one's. Every 32-bit tree carried 64-bit `size_t`, `uintptr_t` and
+`time_t`, and nothing said so: the headers parsed, the structs laid out, the
+numbers were wrong.
+
+It surfaced only because a Windows target started using the generic layer and
+`i386-unknown-linux-gnu` then failed with a typedef redefinition — clang's own
+`size_t` disagreeing with musl's. A failure loud enough to notice, standing in
+for a hundred that were not.
+
+The lesson is the one the whole repository is built on: a per-target answer
+assembled from one target's data is not a smaller kind of correct. Where musl
+has no tree at all — Windows, Darwin, anything bare-metal — the generic layer
+takes every type from the compiler's own macros rather than from whichever tree
+was nearest, and carries no operating-system structures, so `<sys/stat.h>` there
+is a missing header rather than Linux's answer under another name.
