@@ -60,6 +60,11 @@ bump the LLVM tag without touching headers and clients refetch only the wasm.
 }
 ```
 
+`manifest.json` is also how a consumer finds the files: `load()` reads it and
+resolves `abi_query.wasm` to whatever `files.wasm.path` names, so a release
+directory works from its own URL with nothing renamed. Without a manifest — a
+local build directory, a filesystem path — it falls back to the plain names.
+
 `inputs` is what makes a build reproducible and a cache key honest: the LLVM tag,
 the emsdk version, and a hash of the cmake flags are the only things that change
 the output, and they are the CI cache key too. `sha256` is what a consumer

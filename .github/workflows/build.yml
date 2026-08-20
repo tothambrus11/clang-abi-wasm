@@ -132,6 +132,18 @@ jobs:
       - name: Package the release
         run: scripts/package-release.sh
 
+      # A release is content-addressed, so loading one is a different code path
+      # from loading a build directory — and it is the path the release notes
+      # tell people to use. Needs a browser: Node's import() refuses http: URLs,
+      # which is why this went untested long enough to be broken.
+      - name: The release loads the way its notes say it does
+        run: |
+          npm --prefix /tmp/pw init -y >/dev/null 2>&1
+          npm --prefix /tmp/pw install playwright-core >/dev/null 2>&1
+          npx --yes playwright install --with-deps chromium
+          PLAYWRIGHT_MODULE=/tmp/pw/node_modules/playwright-core/index.js \
+            node test/release-load.mjs
+
       - name: Report
         run: |
           {

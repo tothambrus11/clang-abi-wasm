@@ -40,13 +40,13 @@ export function reset() {
  */
 async function instantiate(options) {
   const base = normalizeBase(options.baseUrl);
+  const named = await manifestPaths(base);
+  const at = (name) => named.get(name) ?? resolve(name, base);
 
-  // The Emscripten glue is generated next to the .wasm and .data; letting it
-  // resolve its own siblings keeps this working under any base path.
-  const factory = (await import(/* @vite-ignore */ resolve('abi_query.mjs', base))).default;
+  const factory = (await import(/* @vite-ignore */ at('abi_query.mjs'))).default;
 
   const module = await factory({
-    locateFile: (path) => resolve(path, base),
+    locateFile: (path) => at(path),
     // Emscripten reports the .wasm and the preloaded header pack separately;
     // both are worth showing, since the header pack is the larger of the two.
     setStatus: undefined,
@@ -103,6 +103,41 @@ async function instantiate(options) {
       return rawVersion();
     },
   };
+}
+
+/**
+ * Where the files actually are, according to the manifest.
+ *
+ * A release names them by content — `wasm-9ec58989c571.wasm` — so that they can
+ * be served immutable, and `manifest.json` is the one mutable file that says
+ * which is which. Resolving `abi_query.wasm` by name works for a build
+ * directory and for anything `fetch-abi-module.mjs` laid out, and fails against
+ * a release URL: which is exactly what the README told people to do.
+ *
+ * No manifest is not an error — a local build directory has plain names, and a
+ * filesystem base cannot be fetched at all. Fall back to the plain names.
+ *
+ * @param {string | undefined} base
+ * @returns {Promise<Map<string, string>>}
+ */
+async function manifestPaths(base) {
+  const map = new Map();
+  if (typeof fetch !== 'function') return map;
+  try {
+    const url = resolve('manifest.json', base);
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(url) || url.startsWith('file:')) return map;
+    const response = await fetch(url);
+    if (!response.ok) return map;
+    const manifest = await response.json();
+    const local = { wasm: 'abi_query.wasm', glue: 'abi_query.mjs', headers: 'abi_query.data' };
+    for (const [key, file] of Object.entries(manifest?.files ?? {})) {
+      const name = local[key];
+      if (name && file?.path) map.set(name, resolve(file.path, base));
+    }
+  } catch {
+    // No manifest, or nothing that can fetch one.
+  }
+  return map;
 }
 
 /**

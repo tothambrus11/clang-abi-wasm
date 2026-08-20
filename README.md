@@ -172,7 +172,7 @@ parsing, probe generation, AST-location matching and containment reconstruction
 were deleted, and its browser suite runs in 51 s against the text pipeline's
 1.1 min.
 
-`test/conformance.mjs` — 20 checks — covers what the old pipeline got wrong or
+`test/conformance.mjs` — 23 checks — covers what the old pipeline got wrong or
 could not answer: base specifier source ranges, flexible array members, empty
 members sharing an address, exotic triples, structured *and* rendered
 diagnostics, the drawing model's containment and overlap, the standard library
