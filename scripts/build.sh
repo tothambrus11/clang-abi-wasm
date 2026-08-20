@@ -38,6 +38,18 @@ build_wasm() {
   mkdir -p "$REPO/dist"
   cp "$REPO/build/wasm"/abi_query.{mjs,wasm,data} "$REPO/dist/" 2>/dev/null || true
   cp "$REPO/js/index.mjs" "$REPO/js/index.d.ts" "$REPO/dist/"
+  # A manifest, so a linked local build behaves like a release. The loader reads
+  # the byte counts from it to report download progress, and without one a
+  # developer sees an indeterminate bar where a user sees megabytes — a
+  # difference nothing else would surface.
+  {
+    printf '{\n  "schemaVersion": 1,\n  "version": "%s+dev",\n  "clang": "%s",\n  "files": {\n' \
+      "$(node -p "require('$REPO/js/package.json').version")" "${LLVM_TAG#llvmorg-}"
+    printf '    "wasm": { "path": "abi_query.wasm", "bytes": %s },\n' "$(stat -c %s "$REPO/dist/abi_query.wasm")"
+    printf '    "glue": { "path": "abi_query.mjs", "bytes": %s },\n' "$(stat -c %s "$REPO/dist/abi_query.mjs")"
+    printf '    "headers": { "path": "abi_query.data", "bytes": %s }\n' "$(stat -c %s "$REPO/dist/abi_query.data")"
+    printf '  }\n}\n'
+  } > "$REPO/dist/manifest.json"
   echo
   ls -lh "$REPO/dist"
 }
