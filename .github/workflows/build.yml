@@ -129,6 +129,13 @@ jobs:
       - name: Conformance
         run: node test/conformance.mjs
 
+      # An oracle that is not us. Everything else compares the module's answer
+      # against something derived from the same source; this compiles generated
+      # records with the runner's own gcc and compares sizes, alignments and
+      # every member and base offset.
+      - name: Differential against the system compiler
+        run: node test/differential.mjs 400
+
       - name: Package the release
         run: scripts/package-release.sh
 
