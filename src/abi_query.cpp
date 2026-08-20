@@ -929,8 +929,10 @@ std::string runQuery(llvm::StringRef RequestJson) {
   //                own wrapper, not clang's — put clang's first and libc++
   //                stops the build saying exactly that
   //   clang        its builtin <stddef.h> then include_next's to the C library
-  //   musl (arch)  target-varying declarations
-  //   musl         everything else
+  //   musl (arch)  target-varying declarations: musl's own tree where it has
+  //                one, otherwise `generic`, whose types come from the
+  //                compiler's macros and are right for any target
+  //   musl         everything else, unchanged and architecture-independent
   if (!ResourceDir.empty()) {
     Args.push_back("-resource-dir=" + ResourceDir);
     Args.push_back("-nostdinc");
