@@ -29,7 +29,8 @@ struct Leaf {
   std::vector<std::string> path; // enclosing labels, outermost first
   const RecordDecl *owner = nullptr;
   const FieldDecl *decl = nullptr; // null for vtable slots
-  /// The member's type is empty and it shares an address, so it draws as nothing.
+  /// Clang says it occupies no storage — an empty type allowed to share an
+  /// address. It keeps its offset and draws nothing.
   bool sharesAddress = false;
 };
 

@@ -277,7 +277,11 @@ export interface RenderLeaf {
   /** The record that declares it. */
   ownerId: number | null;
   ownerName: string;
-  /** Empty type at an address something else already covers ([[no_unique_address]]). */
+  /**
+   * It occupies no storage: an empty type allowed to share an address, which
+   * is what `[[no_unique_address]]` permits. `sizeBits` is 0 and the offset is
+   * still where it sits.
+   */
   sharesAddress: boolean;
   location: Location | null;
 }
