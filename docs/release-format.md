@@ -48,7 +48,7 @@ bump the LLVM tag without touching headers and clients refetch only the wasm.
 ```json
 {
   "schemaVersion": 1,
-  "version": "0.1.0+llvm22.1.8",
+  "version": "0.1.1+llvm22.1.8",
   "clang": "22.1.8",
   "built": "2026-08-19T23:14:32Z",
   "inputs": { "llvmTag": "llvmorg-22.1.8", "emsdk": "6.0.7", "cmakeHash": "aa3b58175e47512f" },

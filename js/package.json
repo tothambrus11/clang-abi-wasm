@@ -1,6 +1,6 @@
 {
   "name": "clang-abi-wasm",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Record layout for any target clang knows, as structured data. No text parsing on the consumer side.",
   "type": "module",
   "main": "./index.mjs",
