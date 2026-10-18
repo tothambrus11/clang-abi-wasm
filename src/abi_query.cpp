@@ -991,6 +991,12 @@ std::string runQuery(llvm::StringRef RequestJson) {
   std::shared_ptr<CompilerInvocation> Invocation = createInvocation(Argv, IOpts);
   if (!Invocation)
     return fail("could not build a compiler invocation for target " + Triple);
+  // The driver passes -disable-free, which is right for a process that exits
+  // after one file: it skips tearing down the AST, Sema and the source
+  // manager. This module lives on and answers query after query, so every
+  // translation unit would stay in memory for good, tens of MB for one that
+  // includes the standard library.
+  Invocation->getFrontendOpts().DisableFree = false;
 
   CompilerInstance CI(std::move(Invocation));
   CI.createDiagnostics(Diags.get(), /*ShouldOwnClient=*/false);
