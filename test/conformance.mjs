@@ -539,6 +539,22 @@ check('diagnostics also come rendered, the way clang prints them', () => {
   ok(/int bad = ;/.test(t.replace(/\x1b\[[0-9;]*m/g, '')), 'carries the source line');
 });
 
+// The module answers for as long as its page or editor is open, so a query
+// must leave nothing behind. Only the wasm module keeps state between queries.
+if (existsSync(WASM)) {
+  needsHeaders('memory does not grow from one query to the next', () => {
+    const source = ['string', 'vector', 'map', 'memory', 'functional', 'variant']
+      .map((h) => `#include <${h}>`)
+      .join('\n') + '\nstruct S { std::string s; std::map<int, int> m; };';
+    const req = { triple: 'x86_64-unknown-linux-gnu', lang: 'c++', std: 'c++20', source };
+    for (let i = 0; i < 2; i++) query(req);
+    const before = process.memoryUsage().external;
+    for (let i = 0; i < 5; i++) query(req);
+    const grown = (process.memoryUsage().external - before) / 2 ** 20;
+    ok(grown < 32, `five more queries grew memory by ${grown.toFixed(0)} MB`);
+  });
+}
+
 check('a bad request is a response, not a crash', () => {
   const res = query({ triple: 'not-a-real-triple-at-all', source: 'struct S{int x;};' });
   ok(typeof res.ok === 'boolean', 'still a well-formed response');
